@@ -32,6 +32,16 @@ import { dispatchNodeCommand, getNodeById } from './nodeController.js';
 
 const execFileAsync = promisify(execFile);
 
+function safeJsonParse<T>(raw: string, fallback: T): T {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) return fallback;
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 export interface ProvisionProgressEvent {
   operationId: string;
   step: number;
@@ -165,13 +175,15 @@ export async function syncIncusInstances(viewer?: {
 
   try {
     const { stdout } = await execFileAsync('incus', ['list', '--format=json'], { timeout: 4000 });
-    const list = JSON.parse(stdout) as Array<{
-      name: string;
-      status: string;
-      state?: {
-        network?: Record<string, { addresses?: Array<{ family: string; address: string; scope: string }> }>;
-      };
-    }>;
+    const list = safeJsonParse<
+      Array<{
+        name: string;
+        status: string;
+        state?: {
+          network?: Record<string, { addresses?: Array<{ family: string; address: string; scope: string }> }>;
+        };
+      }>
+    >(stdout, []);
 
     const byName = new Map(list.map((item) => [item.name, item]));
     for (const row of rows) {
@@ -379,11 +391,13 @@ async function waitForInstanceIp(instanceName: string): Promise<string | null> {
       const { stdout } = await execFileAsync('incus', ['list', instanceName, '--format=json'], {
         timeout: 4000,
       });
-      const list = JSON.parse(stdout) as Array<{
-        state?: {
-          network?: Record<string, { addresses?: Array<{ family: string; address: string; scope: string }> }>;
-        };
-      }>;
+      const list = safeJsonParse<
+        Array<{
+          state?: {
+            network?: Record<string, { addresses?: Array<{ family: string; address: string; scope: string }> }>;
+          };
+        }>
+      >(stdout, []);
       const net = list[0]?.state?.network;
       if (net) {
         for (const [iface, netInfo] of Object.entries(net)) {
@@ -944,15 +958,19 @@ export async function listInstanceSnapshots(
   const incusUp = await isIncusReady();
   if (!incusUp) return [];
 
-  const { stdout } = await execFileAsync('incus', ['snapshot', 'list', inst.instance_name, '--format=json'], {
-    timeout: 5000,
-  });
-  const parsed = JSON.parse(stdout) as Array<{ name: string; created_at: string; stateful?: boolean }>;
-  return parsed.map((s) => ({
-    name: s.name,
-    created_at: s.created_at,
-    stateful: Boolean(s.stateful),
-  }));
+  try {
+    const { stdout } = await execFileAsync('incus', ['snapshot', 'list', inst.instance_name, '--format=json'], {
+      timeout: 5000,
+    });
+    const parsed = safeJsonParse<Array<{ name: string; created_at: string; stateful?: boolean }>>(stdout, []);
+    return parsed.map((s) => ({
+      name: s.name,
+      created_at: s.created_at,
+      stateful: Boolean(s.stateful),
+    }));
+  } catch {
+    return [];
+  }
 }
 
 export async function createInstanceSnapshot(params: {
@@ -1166,7 +1184,7 @@ export async function listIncusBackupsAndSnapshots(instanceId: number): Promise<
         ['snapshot', 'list', inst.instance_name, '--format=json'],
         { timeout: 5000 }
       );
-      const liveSnaps = JSON.parse(stdout) as Array<{ name: string; created_at: string }>;
+      const liveSnaps = safeJsonParse<Array<{ name: string; created_at: string }>>(stdout, []);
       const existingSnapNames = new Set(
         (
           db
@@ -1832,21 +1850,23 @@ export async function getIncusInstanceTelemetry(id: number): Promise<VmTelemetry
     const { stdout } = await execFileAsync('incus', ['list', inst.instance_name, '--format=json'], {
       timeout: 3000,
     });
-    const parsed = JSON.parse(stdout) as Array<{
-      status?: string;
-      state?: {
-        memory?: { usage?: number; swap_usage?: number };
-        cpu?: { usage?: number };
-        disk?: Record<string, { usage?: number; total?: number }>;
-        network?: Record<
-          string,
-          {
-            addresses?: Array<{ family: string; address: string; scope: string }>;
-            counters?: { bytes_received?: number; bytes_sent?: number };
-          }
-        >;
-      };
-    }>;
+    const parsed = safeJsonParse<
+      Array<{
+        status?: string;
+        state?: {
+          memory?: { usage?: number; swap_usage?: number };
+          cpu?: { usage?: number };
+          disk?: Record<string, { usage?: number; total?: number }>;
+          network?: Record<
+            string,
+            {
+              addresses?: Array<{ family: string; address: string; scope: string }>;
+              counters?: { bytes_received?: number; bytes_sent?: number };
+            }
+          >;
+        };
+      }>
+    >(stdout, []);
 
     const item = parsed[0];
     if (!item || !item.state) return base;

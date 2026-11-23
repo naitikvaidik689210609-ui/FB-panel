@@ -143,7 +143,7 @@ import {
   checkHostCapabilities,
   collectSystemStats,
 } from './src/server/controllers/systemController.js';
-import { db, getAllSettings, recordAuditLog, setSetting } from './src/server/db.js';
+import { db, getAllSettings, getBackgroundsDir, recordAuditLog, setSetting } from './src/server/db.js';
 import {
   type AuthenticatedRequest,
   canAccessIncusInstance,
@@ -171,18 +171,76 @@ import {
 } from './src/server/security.js';
 import { sendDiscordAlert, sendTelegramAlert } from './src/server/webhook.js';
 
-const PORT = Number(process.env.PORT) || 3000;
+process.on('unhandledRejection', (reason) => {
+  console.error('[FB BAHI Panel] Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[FB BAHI Panel] Uncaught exception:', err);
+});
+
+const PORT = Number(process.env.PORT) || 6767;
 const isProd = process.env.NODE_ENV === 'production';
 
+const VALID_UI_THEMES = [
+  'cyber-purple',
+  'emerald-matrix',
+  'crimson-core',
+  'ocean-cyan',
+  'amber-gold',
+] as const;
+
 let ioRef: SocketIOServer | null = null;
+
+function getDaemonErrorStatus(err: unknown, fallback = 400): number {
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err || '').toLowerCase();
+  if (
+    msg.includes('daemon is unavailable') ||
+    msg.includes('daemon is not available') ||
+    msg.includes('docker daemon') ||
+    msg.includes('incus daemon') ||
+    msg.includes('econnrefused') ||
+    msg.includes('/var/run/docker.sock')
+  ) {
+    return 503;
+  }
+  return fallback;
+}
 
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '5mb' }));
 
+// Validate positive integer resource IDs across all panel API routes
+const NUMERIC_ID_PARAMS = ['id', 'allocId', 'backupId', 'scheduleId', 'subId', 'keyId', 'proxyId'] as const;
+for (const paramName of NUMERIC_ID_PARAMS) {
+  app.param(paramName, (_req, res, next, value: string) => {
+    if (!/^\d+$/.test(value) || Number(value) <= 0) {
+      res.status(400).json({ error: `Invalid numeric ${paramName} parameter.` });
+      return;
+    }
+    next();
+  });
+}
+
+// Serve uploaded custom background media safely (never serve scripts/HTML/SVG)
+app.use(
+  '/uploads/backgrounds',
+  (_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    next();
+  },
+  express.static(getBackgroundsDir(), { maxAge: '1h', fallthrough: true })
+);
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024, files: 10 },
+});
+
+const backgroundUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024, files: 1 },
 });
 
 // ==========================================
@@ -206,6 +264,16 @@ app.get('/api/auth/status', (_req, res) => {
     branding: {
       panelName: settings.panel_name || 'FB BAHI Panel',
       panelSubtitle: settings.panel_subtitle || 'Game Server & Cloud VM Control',
+    },
+    appearance: {
+      theme: (VALID_UI_THEMES as readonly string[]).includes(settings.ui_theme)
+        ? settings.ui_theme
+        : 'cyber-purple',
+      bgUrl: settings.custom_bg_url || '',
+      bgType: (['none', 'image', 'gif', 'video'].includes(settings.custom_bg_type)
+        ? settings.custom_bg_type
+        : 'none') as 'none' | 'image' | 'gif' | 'video',
+      bgOpacity: Math.min(0.9, Math.max(0.05, Number(settings.custom_bg_opacity || '0.35') || 0.35)),
     },
     vpsRebootWarning: settings.vps_reboot_warning || '',
   });
@@ -522,17 +590,21 @@ app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
 });
 
 app.post('/api/auth/2fa/setup', requireAuth, async (req: AuthenticatedRequest, res) => {
-  const secret = generateSecret();
-  const settings = getAllSettings();
-  const issuer = settings.panel_name || 'FB BAHI Panel';
-  const otpauthUri = generateURI({
-    issuer,
-    label: req.user!.email || req.user!.username,
-    secret,
-  });
-  const qrDataUrl = await QRCode.toDataURL(otpauthUri);
-  db.prepare('UPDATE users SET totp_secret = ? WHERE id = ?').run(secret, req.user!.id);
-  res.json({ secret, otpauthUri, qrDataUrl });
+  try {
+    const secret = generateSecret();
+    const settings = getAllSettings();
+    const issuer = settings.panel_name || 'FB BAHI Panel';
+    const otpauthUri = generateURI({
+      issuer,
+      label: req.user!.email || req.user!.username,
+      secret,
+    });
+    const qrDataUrl = await QRCode.toDataURL(otpauthUri);
+    db.prepare('UPDATE users SET totp_secret = ? WHERE id = ?').run(secret, req.user!.id);
+    res.json({ secret, otpauthUri, qrDataUrl });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to initialize 2FA setup.' });
+  }
 });
 
 app.post('/api/auth/2fa/enable', requireAuth, (req: AuthenticatedRequest, res) => {
@@ -1644,6 +1716,49 @@ app.put('/api/settings', requireAuth, requireRole('owner', 'admin'), (req: Authe
     }
   }
 
+  // Appearance & Custom Theme (Owner & Admin)
+  if (
+    typeof body.ui_theme === 'string' &&
+    (VALID_UI_THEMES as readonly string[]).includes(body.ui_theme)
+  ) {
+    setSetting('ui_theme', body.ui_theme);
+  }
+  if (body.custom_bg_opacity !== undefined) {
+    const op = Math.min(0.9, Math.max(0.05, Number(body.custom_bg_opacity) || 0.35));
+    setSetting('custom_bg_opacity', op.toFixed(2));
+  }
+  if (typeof body.custom_bg_url === 'string') {
+    const rawBg = body.custom_bg_url.trim();
+    if (!rawBg) {
+      setSetting('custom_bg_url', '');
+      setSetting('custom_bg_type', 'none');
+    } else if (
+      rawBg.startsWith('/uploads/backgrounds/') ||
+      rawBg.startsWith('https://') ||
+      rawBg.startsWith('http://')
+    ) {
+      setSetting('custom_bg_url', rawBg.slice(0, 500));
+      if (
+        typeof body.custom_bg_type === 'string' &&
+        ['image', 'gif', 'video'].includes(body.custom_bg_type)
+      ) {
+        setSetting('custom_bg_type', body.custom_bg_type);
+      } else {
+        const lower = rawBg.toLowerCase();
+        const inferred =
+          lower.endsWith('.mp4') || lower.endsWith('.webm')
+            ? 'video'
+            : lower.endsWith('.gif')
+            ? 'gif'
+            : 'image';
+        setSetting('custom_bg_type', inferred);
+      }
+    } else {
+      res.status(400).json({ error: 'Custom background URL must start with /uploads/backgrounds/, https://, or http://.' });
+      return;
+    }
+  }
+
   recordAuditLog({
     userId: req.user!.id,
     username: req.user!.username,
@@ -1656,29 +1771,137 @@ app.put('/api/settings', requireAuth, requireRole('owner', 'admin'), (req: Authe
   res.json({ settings: maskSettingsForResponse(getAllSettings(), req.user!.role) });
 });
 
-app.post('/api/settings/test-webhook', requireAuth, requireRole('owner', 'admin'), async (req: AuthenticatedRequest, res) => {
-  const result = await sendDiscordAlert({
-    event: 'test',
-    title: 'FB BAHI Panel Webhook Test',
-    description: `Webhook integration verified by **${req.user!.username}**.`,
-  });
-  if (!result.sent) {
-    res.status(400).json({ error: result.reason || 'Webhook delivery failed.' });
-    return;
+app.post(
+  '/api/settings/background',
+  requireAuth,
+  requireRole('owner', 'admin'),
+  backgroundUpload.single('background'),
+  (req: AuthenticatedRequest, res) => {
+    try {
+      const file = req.file;
+      if (!file) {
+        res.status(400).json({ error: 'Please select an image, GIF, or MP4/WebM video file.' });
+        return;
+      }
+
+      const ext = path.extname(file.originalname || '').toLowerCase();
+      const allowedExts: Record<string, 'image' | 'gif' | 'video'> = {
+        '.png': 'image',
+        '.jpg': 'image',
+        '.jpeg': 'image',
+        '.webp': 'image',
+        '.gif': 'gif',
+        '.mp4': 'video',
+        '.webm': 'video',
+      };
+      const bgType = allowedExts[ext];
+      if (!bgType) {
+        res.status(400).json({
+          error: 'Unsupported media format. Allowed: PNG, JPG, WEBP, GIF, MP4, WEBM.',
+        });
+        return;
+      }
+
+      const bgDir = getBackgroundsDir();
+      fs.mkdirSync(bgDir, { recursive: true });
+
+      // Remove prior uploaded background file to avoid disk bloat
+      const prevUrl = getAllSettings().custom_bg_url || '';
+      if (prevUrl.startsWith('/uploads/backgrounds/')) {
+        const prevFilename = path.basename(prevUrl);
+        const prevPath = resolveConfinedPath(bgDir, prevFilename);
+        if (fs.existsSync(prevPath)) {
+          fs.rmSync(prevPath, { force: true });
+        }
+      }
+
+      const filename = `bg-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;
+      const destPath = resolveConfinedPath(bgDir, filename);
+      fs.writeFileSync(destPath, file.buffer);
+
+      const publicUrl = `/uploads/backgrounds/${filename}`;
+      setSetting('custom_bg_url', publicUrl);
+      setSetting('custom_bg_type', bgType);
+
+      recordAuditLog({
+        userId: req.user!.id,
+        username: req.user!.username,
+        action: 'settings.background_upload',
+        target: filename,
+        details: `Uploaded ${bgType} background (${(file.size / 1024).toFixed(1)} KB)`,
+        ipAddress: getClientIp(req),
+      });
+
+      res.json({
+        bgUrl: publicUrl,
+        bgType,
+        settings: maskSettingsForResponse(getAllSettings(), req.user!.role),
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Background upload failed.' });
+    }
   }
-  res.json({ sent: true, telegramSent: Boolean(result.telegramSent) });
+);
+
+app.delete(
+  '/api/settings/background',
+  requireAuth,
+  requireRole('owner', 'admin'),
+  (req: AuthenticatedRequest, res) => {
+    const bgDir = getBackgroundsDir();
+    const prevUrl = getAllSettings().custom_bg_url || '';
+    if (prevUrl.startsWith('/uploads/backgrounds/')) {
+      const prevFilename = path.basename(prevUrl);
+      const prevPath = resolveConfinedPath(bgDir, prevFilename);
+      if (fs.existsSync(prevPath)) {
+        fs.rmSync(prevPath, { force: true });
+      }
+    }
+    setSetting('custom_bg_url', '');
+    setSetting('custom_bg_type', 'none');
+    recordAuditLog({
+      userId: req.user!.id,
+      username: req.user!.username,
+      action: 'settings.background_reset',
+      target: 'panel_background',
+      details: 'Removed custom panel background media',
+      ipAddress: getClientIp(req),
+    });
+    res.json({ settings: maskSettingsForResponse(getAllSettings(), req.user!.role) });
+  }
+);
+
+app.post('/api/settings/test-webhook', requireAuth, requireRole('owner', 'admin'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const result = await sendDiscordAlert({
+      event: 'test',
+      title: 'FB BAHI Panel Webhook Test',
+      description: `Webhook integration verified by **${req.user!.username}**.`,
+    });
+    if (!result.sent) {
+      res.status(400).json({ error: result.reason || 'Webhook delivery failed.' });
+      return;
+    }
+    res.json({ sent: true, telegramSent: Boolean(result.telegramSent) });
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : 'Webhook test failed.' });
+  }
 });
 
 app.post('/api/settings/test-telegram', requireAuth, requireRole('owner'), async (req: AuthenticatedRequest, res) => {
-  const result = await sendTelegramAlert({
-    title: 'Telegram Bot Test',
-    description: `Telegram alert channel verified by ${req.user!.username}.`,
-  });
-  if (!result.sent) {
-    res.status(400).json({ error: result.reason || 'Telegram delivery failed.' });
-    return;
+  try {
+    const result = await sendTelegramAlert({
+      title: 'Telegram Bot Test',
+      description: `Telegram alert channel verified by ${req.user!.username}.`,
+    });
+    if (!result.sent) {
+      res.status(400).json({ error: result.reason || 'Telegram delivery failed.' });
+      return;
+    }
+    res.json({ sent: true });
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : 'Telegram test failed.' });
   }
-  res.json({ sent: true });
 });
 
 app.post('/api/settings/test-cloud', requireAuth, requireRole('owner'), async (_req, res) => {
@@ -1983,7 +2206,7 @@ app.post('/api/minecraft/servers/:id/power', requireAuth, async (req: Authentica
     });
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Power action failed.' });
+    res.status(getDaemonErrorStatus(err)).json({ error: err instanceof Error ? err.message : 'Power action failed.' });
   }
 });
 
@@ -1998,7 +2221,7 @@ app.get('/api/minecraft/servers/:id/metrics', requireAuth, async (req: Authentic
     const metrics = await getMinecraftContainerMetrics(id);
     res.json(metrics);
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to fetch metrics.' });
+    res.status(getDaemonErrorStatus(err)).json({ error: err instanceof Error ? err.message : 'Failed to fetch metrics.' });
   }
 });
 
@@ -2013,7 +2236,7 @@ app.get('/api/minecraft/servers/:id/logs', requireAuth, async (req: Authenticate
     const lines = await getMinecraftLogs(id);
     res.json({ lines });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to fetch logs.' });
+    res.status(getDaemonErrorStatus(err)).json({ error: err instanceof Error ? err.message : 'Failed to fetch logs.' });
   }
 });
 
@@ -2037,7 +2260,7 @@ app.post('/api/minecraft/servers/:id/command', requireAuth, async (req: Authenti
     });
     res.json({ sent: true });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to send command.' });
+    res.status(getDaemonErrorStatus(err)).json({ error: err instanceof Error ? err.message : 'Failed to send command.' });
   }
 });
 
@@ -2885,7 +3108,7 @@ app.post('/api/incus/instances/:id/power', requireAuth, async (req: Authenticate
     });
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Instance action failed.' });
+    res.status(getDaemonErrorStatus(err)).json({ error: err instanceof Error ? err.message : 'Instance action failed.' });
   }
 });
 
@@ -2908,7 +3131,7 @@ app.post('/api/incus/instances/:id/rename', requireAuth, async (req: Authenticat
     });
     res.json({ instance });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Rename failed.' });
+    res.status(getDaemonErrorStatus(err)).json({ error: err instanceof Error ? err.message : 'Rename failed.' });
   }
 });
 
@@ -2956,7 +3179,7 @@ app.post('/api/incus/instances/:id/reinstall', requireAuth, async (req: Authenti
         detail: message,
       });
     }
-    res.status(400).json({ error: message });
+    res.status(getDaemonErrorStatus(err)).json({ error: message });
   }
 });
 
@@ -2971,7 +3194,7 @@ app.get('/api/incus/instances/:id/metrics', requireAuth, async (req: Authenticat
     const metrics = await getIncusInstanceTelemetry(id);
     res.json(metrics);
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to fetch metrics.' });
+    res.status(getDaemonErrorStatus(err)).json({ error: err instanceof Error ? err.message : 'Failed to fetch metrics.' });
   }
 });
 
@@ -3318,11 +3541,16 @@ app.get('/api/incus/instances/:id/files/download', requireAuth, async (req: Auth
       targetPath,
       archiveFormat: format,
     });
-    res.download(filePath, filename, () => {
+    res.download(filePath, filename, (err) => {
       fs.rmSync(cleanupDir, { recursive: true, force: true });
+      if (err && !res.headersSent) {
+        res.status(500).json({ error: 'File download failed.' });
+      }
     });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Download failed.' });
+    if (!res.headersSent) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Download failed.' });
+    }
   }
 });
 
@@ -3520,9 +3748,15 @@ app.get(
         return;
       }
       const { filePath, filename } = await getIncusBackupArchivePath(id, backupId);
-      res.download(filePath, filename);
+      res.download(filePath, filename, (err) => {
+        if (err && !res.headersSent) {
+          res.status(500).json({ error: 'Backup archive download failed.' });
+        }
+      });
     } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'Download failed.' });
+      if (!res.headersSent) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Download failed.' });
+      }
     }
   }
 );
@@ -4247,6 +4481,10 @@ async function startServer() {
       }
     });
 
+    socket.on('mc:detach', () => {
+      cleanupLogStream();
+    });
+
     socket.on('mc:command', async (payload: { serverId?: number; command?: string }) => {
       try {
         const serverId = Number(payload?.serverId);
@@ -4338,6 +4576,9 @@ async function startServer() {
 
         const proc = spawn('incus', args, { stdio: ['pipe', 'pipe', 'pipe'] });
         shellProc = proc;
+        proc.on('error', (err) => {
+          socket.emit('incus:shell:data', `\r\n\x1b[31m[Shell Spawn Error] ${err.message}\x1b[0m\r\n`);
+        });
         proc.stdout?.on('data', (chunk: Buffer) => {
           socket.emit('incus:shell:data', chunk.toString('utf8').replace(/\n/g, '\r\n'));
         });
@@ -4352,6 +4593,10 @@ async function startServer() {
         });
       }
     );
+
+    socket.on('incus:shell:stop', () => {
+      cleanupShellProc();
+    });
 
     socket.on('incus:shell:resize', (payload: { cols?: number; rows?: number }) => {
       if (!shellPty) return;
@@ -4396,6 +4641,31 @@ async function startServer() {
     });
   });
 
+  // Global Express error handler (Multer / JSON parse / unexpected route errors)
+  app.use(
+    (
+      err: Error & { status?: number; code?: string },
+      _req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (res.headersSent) {
+        next(err);
+        return;
+      }
+      if (err instanceof multer.MulterError) {
+        const msg =
+          err.code === 'LIMIT_FILE_SIZE'
+            ? 'Uploaded file exceeds the maximum allowed size limit.'
+            : `Upload error: ${err.message}`;
+        res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: msg });
+        return;
+      }
+      const status = typeof err.status === 'number' && err.status >= 400 ? err.status : 500;
+      res.status(status).json({ error: err.message || 'Internal server error.' });
+    }
+  );
+
   if (!isProd) {
     const vite = await createViteServer({
       server: {
@@ -4413,9 +4683,51 @@ async function startServer() {
     });
   }
 
+  httpServer.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(
+        `[FB BAHI Panel] Port ${PORT} is already in use. Stop the conflicting process or set a different PORT in .env.`
+      );
+      process.exit(1);
+    }
+    if (err.code === 'EACCES') {
+      console.error(`[FB BAHI Panel] Permission denied binding to port ${PORT}.`);
+      process.exit(1);
+    }
+    console.error('[FB BAHI Panel] HTTP server error:', err);
+    process.exit(1);
+  });
+
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`FB BAHI Panel listening on http://0.0.0.0:${PORT}`);
   });
+
+  const gracefulShutdown = (signal: string) => {
+    console.log(`[FB BAHI Panel] Received ${signal}. Shutting down cleanly...`);
+    io.close();
+    httpServer.close(() => {
+      try {
+        db.close();
+      } catch {
+        // ignore if already closed
+      }
+      process.exit(0);
+    });
+    setTimeout(() => {
+      try {
+        db.close();
+      } catch {
+        // ignore
+      }
+      process.exit(0);
+    }, 5000).unref();
+  };
+
+  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.once('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
-void startServer();
+void startServer().catch((err) => {
+  console.error('[FB BAHI Panel] Fatal startup error:', err);
+  process.exit(1);
+});

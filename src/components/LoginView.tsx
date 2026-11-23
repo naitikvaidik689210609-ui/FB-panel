@@ -1,7 +1,7 @@
 import { AlertTriangle, CheckCircle2, KeyRound, Lock, Mail, ShieldCheck, Smartphone, User } from 'lucide-react';
 import { type FormEvent, useEffect, useState } from 'react';
 import { apiFetch } from '../lib/api';
-import type { AuthUser, PanelBranding } from '../types';
+import type { AuthUser, PanelAppearance, PanelBranding } from '../types';
 
 interface LoginViewProps {
   needsSetup: boolean;
@@ -10,6 +10,7 @@ interface LoginViewProps {
   maintenanceMode: boolean;
   maintenanceMessage: string;
   branding: PanelBranding;
+  appearance?: PanelAppearance;
   onSuccess: (token: string, user: AuthUser) => void;
 }
 
@@ -20,6 +21,7 @@ export function LoginView({
   maintenanceMode,
   maintenanceMessage,
   branding,
+  appearance,
   onSuccess,
 }: LoginViewProps) {
   const [mode, setMode] = useState<'setup' | 'login' | 'register'>(needsSetup ? 'setup' : 'login');
@@ -124,13 +126,39 @@ export function LoginView({
   }
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center bg-[#0d0a1a] px-4 py-12">
+    <div className="relative flex min-h-screen items-center justify-center bg-[var(--bg-base)] px-4 py-12">
+      {appearance?.bgUrl && appearance.bgType !== 'none' && (
+        <div aria-hidden="true" className="pointer-events-none fixed inset-0 overflow-hidden">
+          {appearance.bgType === 'video' ? (
+            <video
+              key={appearance.bgUrl}
+              src={appearance.bgUrl}
+              autoPlay
+              loop
+              muted
+              playsInline
+              className="h-full w-full object-cover"
+              style={{ opacity: appearance.bgOpacity }}
+            />
+          ) : (
+            <img
+              key={appearance.bgUrl}
+              src={appearance.bgUrl}
+              alt=""
+              className="h-full w-full object-cover"
+              style={{ opacity: appearance.bgOpacity }}
+            />
+          )}
+          <div className="absolute inset-0 bg-gradient-to-b from-[#070510]/65 via-[#090714]/55 to-[#070510]/80" />
+        </div>
+      )}
+
       <div
         aria-hidden="true"
         className="pointer-events-none fixed inset-0 overflow-hidden"
         style={{
           background:
-            'radial-gradient(circle at 22% 18%, rgba(124, 58, 237, 0.16), transparent 45%), radial-gradient(circle at 80% 78%, rgba(139, 92, 246, 0.12), transparent 42%)',
+            'radial-gradient(circle at 22% 18%, rgba(var(--accent-rgb), 0.16), transparent 45%), radial-gradient(circle at 80% 78%, rgba(var(--accent-soft-rgb), 0.12), transparent 42%)',
         }}
       />
 

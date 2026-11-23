@@ -37,6 +37,7 @@ import type {
   HostCapabilities,
   LiveSystemStats,
   MinecraftServer,
+  PanelAppearance,
   PanelBranding,
   UserQuotaSummary,
   VmInstance,
@@ -72,6 +73,12 @@ export default function App() {
   const [branding, setBranding] = useState<PanelBranding>({
     panelName: 'FB BAHI Panel',
     panelSubtitle: 'Game Server & Cloud VM Control',
+  });
+  const [appearance, setAppearance] = useState<PanelAppearance>({
+    theme: 'cyber-purple',
+    bgUrl: '',
+    bgType: 'none',
+    bgOpacity: 0.35,
   });
   const [user, setUser] = useState<AuthUser | null>(null);
   const [quota, setQuota] = useState<UserQuotaSummary | null>(null);
@@ -112,6 +119,7 @@ export default function App() {
       maintenanceMessage: string;
       announcement: AnnouncementConfig;
       branding: PanelBranding;
+      appearance?: PanelAppearance;
       vpsRebootWarning: string;
     }>('/api/auth/status')
       .then((res) => {
@@ -122,10 +130,17 @@ export default function App() {
         setMaintenanceMessage(res.maintenanceMessage);
         setAnnouncement(res.announcement);
         setBranding(res.branding);
+        if (res.appearance) {
+          setAppearance(res.appearance);
+        }
         setVpsRebootWarning(res.vpsRebootWarning || '');
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', appearance.theme || 'cyber-purple');
+  }, [appearance.theme]);
 
   const handleLogout = useCallback(() => {
     setAuthToken(null);
@@ -274,6 +289,7 @@ export default function App() {
         maintenanceMode={maintenanceMode}
         maintenanceMessage={maintenanceMessage}
         branding={branding}
+        appearance={appearance}
         onSuccess={handleAuthSuccess}
       />
     );
@@ -345,14 +361,41 @@ export default function App() {
   const currentMeta = sectionMeta[activeSection];
 
   return (
-    <div className="flex min-h-screen bg-[#0d0a1a] text-slate-100">
+    <div className="relative flex min-h-screen bg-[var(--bg-base)] text-slate-100">
+      {/* Custom Media Background (Image / GIF / Video) */}
+      {appearance.bgUrl && appearance.bgType !== 'none' && (
+        <div aria-hidden="true" className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
+          {appearance.bgType === 'video' ? (
+            <video
+              key={appearance.bgUrl}
+              src={appearance.bgUrl}
+              autoPlay
+              loop
+              muted
+              playsInline
+              className="h-full w-full object-cover"
+              style={{ opacity: appearance.bgOpacity }}
+            />
+          ) : (
+            <img
+              key={appearance.bgUrl}
+              src={appearance.bgUrl}
+              alt=""
+              className="h-full w-full object-cover"
+              style={{ opacity: appearance.bgOpacity }}
+            />
+          )}
+          <div className="absolute inset-0 bg-gradient-to-b from-[#070510]/65 via-[#090714]/55 to-[#070510]/80" />
+        </div>
+      )}
+
       {/* Ambient Subtle Glow */}
       <div
         aria-hidden="true"
         className="pointer-events-none fixed inset-0 z-0"
         style={{
           background:
-            'radial-gradient(circle at 12% 10%, rgba(124, 58, 237, 0.14), transparent 38%), radial-gradient(circle at 88% 85%, rgba(109, 40, 217, 0.1), transparent 40%)',
+            'radial-gradient(circle at 12% 10%, rgba(var(--accent-rgb), 0.14), transparent 38%), radial-gradient(circle at 88% 85%, rgba(var(--accent-soft-rgb), 0.1), transparent 40%)',
         }}
       />
 
@@ -614,6 +657,7 @@ export default function App() {
             <SettingsView
               currentUser={user}
               onBrandingChange={setBranding}
+              onAppearanceChange={setAppearance}
               onAnnouncementChange={setAnnouncement}
               onRebootWarningChange={setVpsRebootWarning}
               onUserRefresh={refreshMe}

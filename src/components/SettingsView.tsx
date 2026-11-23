@@ -6,33 +6,47 @@ import {
   Cloud,
   Copy,
   Globe,
+  Image as ImageIcon,
   Key,
   KeyRound,
   Mail,
   Network,
+  Palette,
   Plus,
   Save,
   Send,
   ShieldAlert,
   Smartphone,
   Trash2,
+  Upload,
   UserPlus,
 } from 'lucide-react';
-import { type FormEvent, useCallback, useEffect, useState } from 'react';
-import { apiFetch } from '../lib/api';
+import { type ChangeEvent, type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { apiFetch, copyToClipboard } from '../lib/api';
 import type {
   AnnouncementConfig,
   ApiKeyItem,
   AuthUser,
+  PanelAppearance,
   PanelBranding,
   PanelSettings,
   PortAllocation,
   PortPoolItem,
+  UiThemeId,
 } from '../types';
+
+const UI_THEME_PRESETS: Array<{ id: UiThemeId; label: string; color: string }> = [
+  { id: 'cyber-purple', label: 'Cyber Purple', color: '#7c3aed' },
+  { id: 'emerald-matrix', label: 'Emerald Matrix', color: '#10b981' },
+  { id: 'crimson-core', label: 'Crimson Core', color: '#e11d48' },
+  { id: 'ocean-cyan', label: 'Ocean Cyan', color: '#06b6d4' },
+  { id: 'amber-gold', label: 'Amber Gold', color: '#d97706' },
+];
 
 interface SettingsViewProps {
   currentUser: AuthUser;
   onBrandingChange: (branding: PanelBranding) => void;
+  onAppearanceChange: (appearance: PanelAppearance) => void;
   onAnnouncementChange: (announcement: AnnouncementConfig) => void;
   onRebootWarningChange: (warning: string) => void;
   onUserRefresh: () => Promise<void>;
@@ -42,6 +56,7 @@ interface SettingsViewProps {
 export function SettingsView({
   currentUser,
   onBrandingChange,
+  onAppearanceChange,
   onAnnouncementChange,
   onRebootWarningChange,
   onUserRefresh,
@@ -83,8 +98,14 @@ export function SettingsView({
     cloud_auto_upload: '0',
     openai_api_key: '',
     openai_model: 'gpt-4o-mini',
+    ui_theme: 'cyber-purple',
+    custom_bg_url: '',
+    custom_bg_type: 'none',
+    custom_bg_opacity: '0.35',
   });
   const [saving, setSaving] = useState(false);
+  const [uploadingBg, setUploadingBg] = useState(false);
+  const bgFileInputRef = useRef<HTMLInputElement | null>(null);
   const [testingWebhook, setTestingWebhook] = useState(false);
   const [testingTelegram, setTestingTelegram] = useState(false);
   const [testingCloud, setTestingCloud] = useState(false);
@@ -168,6 +189,15 @@ export function SettingsView({
         panelName: res.settings.panel_name,
         panelSubtitle: res.settings.panel_subtitle,
       });
+      onAppearanceChange({
+        theme: (res.settings.ui_theme as UiThemeId) || 'cyber-purple',
+        bgUrl: res.settings.custom_bg_url || '',
+        bgType:
+          (['none', 'image', 'gif', 'video'].includes(res.settings.custom_bg_type || '')
+            ? res.settings.custom_bg_type
+            : 'none') as PanelAppearance['bgType'],
+        bgOpacity: Number(res.settings.custom_bg_opacity || '0.35') || 0.35,
+      });
       onAnnouncementChange({
         enabled: res.settings.announcement_enabled === '1',
         level:
@@ -180,6 +210,66 @@ export function SettingsView({
       onNotify(err instanceof Error ? err.message : 'Failed to save settings', 'error');
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleUploadBackground(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setUploadingBg(true);
+    try {
+      const form = new FormData();
+      form.append('background', file);
+      const res = await apiFetch<{
+        bgUrl: string;
+        bgType: PanelAppearance['bgType'];
+        settings: PanelSettings;
+      }>('/api/settings/background', {
+        method: 'POST',
+        body: form,
+      });
+      setSettings((prev) => ({
+        ...prev,
+        custom_bg_url: res.bgUrl,
+        custom_bg_type: res.bgType,
+      }));
+      onAppearanceChange({
+        theme: (res.settings.ui_theme as UiThemeId) || 'cyber-purple',
+        bgUrl: res.bgUrl,
+        bgType: res.bgType,
+        bgOpacity: Number(res.settings.custom_bg_opacity || '0.35') || 0.35,
+      });
+      onNotify('Custom background uploaded and activated.');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Failed to upload background', 'error');
+    } finally {
+      setUploadingBg(false);
+    }
+  }
+
+  async function handleResetBackground() {
+    setUploadingBg(true);
+    try {
+      const res = await apiFetch<{ settings: PanelSettings }>('/api/settings/background', {
+        method: 'DELETE',
+      });
+      setSettings((prev) => ({
+        ...prev,
+        custom_bg_url: '',
+        custom_bg_type: 'none',
+      }));
+      onAppearanceChange({
+        theme: (res.settings.ui_theme as UiThemeId) || 'cyber-purple',
+        bgUrl: '',
+        bgType: 'none',
+        bgOpacity: Number(res.settings.custom_bg_opacity || '0.35') || 0.35,
+      });
+      onNotify('Custom background removed.');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Failed to remove background', 'error');
+    } finally {
+      setUploadingBg(false);
     }
   }
 
@@ -641,6 +731,133 @@ export function SettingsView({
                   />
                   Notify on force kill or unexpected crash
                 </label>
+              </div>
+
+              {/* GUI Color Theme & Custom Media Background */}
+              <div className="space-y-4 border-t border-violet-500/15 pt-4">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="flex items-center gap-2 text-xs font-medium text-slate-200">
+                    <Palette className="h-4 w-4 text-violet-400" />
+                    GUI Color Theme &amp; Custom Media Background
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+                  {UI_THEME_PRESETS.map((preset) => {
+                    const selected = (settings.ui_theme || 'cyber-purple') === preset.id;
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => {
+                          setSettings({ ...settings, ui_theme: preset.id });
+                          onAppearanceChange({
+                            theme: preset.id,
+                            bgUrl: settings.custom_bg_url || '',
+                            bgType:
+                              (['none', 'image', 'gif', 'video'].includes(
+                                settings.custom_bg_type || ''
+                              )
+                                ? settings.custom_bg_type
+                                : 'none') as PanelAppearance['bgType'],
+                            bgOpacity: Number(settings.custom_bg_opacity || '0.35') || 0.35,
+                          });
+                        }}
+                        className={`flex items-center gap-2 rounded-lg border px-2.5 py-2 text-left text-xs transition-colors ${
+                          selected
+                            ? 'border-white/50 bg-white/10 text-white font-semibold'
+                            : 'border-violet-500/20 bg-[#090714]/60 text-slate-300 hover:border-violet-400/40'
+                        }`}
+                      >
+                        <span
+                          className="h-3 w-3 shrink-0 rounded-full"
+                          style={{ backgroundColor: preset.color }}
+                        />
+                        <span className="truncate">{preset.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="space-y-2.5 rounded-lg border border-violet-500/20 bg-[#090714]/50 p-3.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="flex items-center gap-1.5 text-xs font-medium text-slate-300">
+                      <ImageIcon className="h-3.5 w-3.5 text-violet-400" />
+                      Custom Background (Image / GIF / MP4 / WebM)
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <input
+                        ref={bgFileInputRef}
+                        type="file"
+                        accept=".png,.jpg,.jpeg,.webp,.gif,.mp4,.webm"
+                        onChange={(e) => void handleUploadBackground(e)}
+                        className="hidden"
+                      />
+                      <button
+                        type="button"
+                        disabled={uploadingBg}
+                        onClick={() => bgFileInputRef.current?.click()}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-violet-500/35 bg-violet-600/20 px-3 py-1.5 text-xs font-medium text-violet-200 hover:bg-violet-600/30 disabled:opacity-50 whitespace-nowrap shrink-0"
+                      >
+                        <Upload className="h-3.5 w-3.5" />
+                        {uploadingBg ? 'Uploading...' : 'Upload Media'}
+                      </button>
+                      {settings.custom_bg_url && (
+                        <button
+                          type="button"
+                          disabled={uploadingBg}
+                          onClick={() => void handleResetBackground()}
+                          className="inline-flex items-center gap-1 rounded-lg border border-red-500/35 px-2.5 py-1.5 text-xs font-medium text-red-200 hover:bg-red-500/15 disabled:opacity-50 whitespace-nowrap shrink-0"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 sm:items-center">
+                    <div className="sm:col-span-2">
+                      <input
+                        type="text"
+                        value={settings.custom_bg_url || ''}
+                        onChange={(e) =>
+                          setSettings({ ...settings, custom_bg_url: e.target.value })
+                        }
+                        placeholder="Uploaded path or https://... (.png, .gif, .mp4)"
+                        className="w-full rounded-lg border border-violet-500/25 bg-[#090714]/80 px-3 py-1.5 font-mono text-xs text-white placeholder-slate-500 focus:border-violet-400 focus:outline-none"
+                      />
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-slate-400 whitespace-nowrap">
+                        Opacity {Math.round((Number(settings.custom_bg_opacity || 0.35) || 0.35) * 100)}%
+                      </span>
+                      <input
+                        type="range"
+                        min={0.1}
+                        max={0.85}
+                        step={0.05}
+                        value={Number(settings.custom_bg_opacity || 0.35) || 0.35}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setSettings({ ...settings, custom_bg_opacity: val });
+                          onAppearanceChange({
+                            theme: (settings.ui_theme as UiThemeId) || 'cyber-purple',
+                            bgUrl: settings.custom_bg_url || '',
+                            bgType:
+                              (['none', 'image', 'gif', 'video'].includes(
+                                settings.custom_bg_type || ''
+                              )
+                                ? settings.custom_bg_type
+                                : 'none') as PanelAppearance['bgType'],
+                            bgOpacity: Number(val) || 0.35,
+                          });
+                        }}
+                        className="w-full accent-violet-500"
+                      />
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -1168,8 +1385,9 @@ export function SettingsView({
                     <button
                       type="button"
                       onClick={() => {
-                        void navigator.clipboard.writeText(createdRawKey);
-                        setCopiedKey(true);
+                        void copyToClipboard(createdRawKey).then((ok) => {
+                          if (ok) setCopiedKey(true);
+                        });
                       }}
                       className="inline-flex items-center gap-1 rounded border border-emerald-500/40 px-2.5 py-1.5 text-xs font-medium text-emerald-200 hover:bg-emerald-500/20 whitespace-nowrap shrink-0"
                     >

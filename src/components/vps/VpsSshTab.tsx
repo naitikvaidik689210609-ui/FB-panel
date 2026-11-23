@@ -1,6 +1,6 @@
 import { Copy, Eye, EyeOff, KeyRound, Plus, RefreshCw, Shield, Terminal, Trash2 } from 'lucide-react';
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
-import { apiFetch } from '../../lib/api';
+import { apiFetch, copyToClipboard } from '../../lib/api';
 import type { VmInstance, VmSshDetails } from '../../types';
 
 interface VpsSshTabProps {
@@ -141,8 +141,9 @@ export function VpsSshTab({ instance, onNotify, onOpenConsole }: VpsSshTabProps)
               <button
                 type="button"
                 onClick={() => {
-                  void navigator.clipboard.writeText(sshCmd);
-                  onNotify('Copied SSH command.');
+                  void copyToClipboard(sshCmd).then((ok) => {
+                    onNotify(ok ? 'Copied SSH command.' : 'Clipboard unavailable.', ok ? 'success' : 'error');
+                  });
                 }}
                 className="inline-flex items-center gap-1 rounded border border-violet-500/30 px-2.5 py-1 text-xs text-violet-200 hover:bg-violet-600/20 whitespace-nowrap shrink-0"
               >
@@ -184,8 +185,9 @@ export function VpsSshTab({ instance, onNotify, onOpenConsole }: VpsSshTabProps)
                   <button
                     type="button"
                     onClick={() => {
-                      void navigator.clipboard.writeText(details.rootPassword);
-                      onNotify('Copied root password.');
+                      void copyToClipboard(details.rootPassword).then((ok) => {
+                        onNotify(ok ? 'Copied root password.' : 'Clipboard unavailable.', ok ? 'success' : 'error');
+                      });
                     }}
                     className="rounded p-1 text-slate-400 hover:text-white"
                     title="Copy password"

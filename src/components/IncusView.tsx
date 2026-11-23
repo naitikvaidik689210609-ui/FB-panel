@@ -31,7 +31,7 @@ import {
 } from 'lucide-react';
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import type { Socket } from 'socket.io-client';
-import { apiDownloadFile, apiFetch, formatBytes } from '../lib/api';
+import { apiDownloadFile, apiFetch, copyToClipboard, formatBytes } from '../lib/api';
 import type {
   AuthUser,
   IncusBackupItem,
@@ -310,6 +310,7 @@ export function IncusView({
     if (rescuePending) setRescuePending(false);
     return () => {
       socket.off('incus:shell:data', handleShellData);
+      socket.emit('incus:shell:stop');
     };
   }, [socket, selected?.id, activeTab, rescuePending]);
 
@@ -786,8 +787,9 @@ export function IncusView({
   }
 
   function handleCopy(text: string, label: string) {
-    void navigator.clipboard.writeText(text);
-    onNotify(`Copied ${label} to clipboard.`);
+    void copyToClipboard(text).then((ok) => {
+      onNotify(ok ? `Copied ${label} to clipboard.` : 'Clipboard unavailable.', ok ? 'success' : 'error');
+    });
   }
 
   return (

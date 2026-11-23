@@ -1217,9 +1217,21 @@ export function streamServerBackupZip(id: number, res: Response): void {
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}"`);
 
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      try {
+        archive.abort();
+      } catch {
+        // ignore abort error
+      }
+    }
+  });
+
   archive.on('error', (err: Error) => {
     if (!res.headersSent) {
       res.status(500).json({ error: err.message });
+    } else if (!res.writableEnded) {
+      res.destroy(err);
     }
   });
 
@@ -1641,7 +1653,11 @@ export async function downloadMinecraftBackupFile(
     }
   }
 
-  res.download(filePath, backup.filename);
+  res.download(filePath, backup.filename, (err) => {
+    if (err && !res.headersSent) {
+      res.status(500).json({ error: 'Backup download failed.' });
+    }
+  });
 }
 
 export async function deleteMinecraftBackup(params: {

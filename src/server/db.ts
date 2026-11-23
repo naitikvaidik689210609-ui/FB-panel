@@ -4,10 +4,15 @@ import path from 'node:path';
 
 const dbPath = path.resolve(process.env.DB_PATH || path.join(process.cwd(), 'data', 'panel.db'));
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(process.cwd(), 'data', 'servers'));
+const uploadsDir = path.resolve(process.env.UPLOADS_DIR || path.join(process.cwd(), 'uploads'));
+const backgroundsDir = path.join(uploadsDir, 'backgrounds');
+const backupsDir = path.resolve(process.env.BACKUPS_DIR || path.join(process.cwd(), 'backups'));
 
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 fs.mkdirSync(path.join(dataDir, 'mc'), { recursive: true });
 fs.mkdirSync(path.join(dataDir, 'vm-backups'), { recursive: true });
+fs.mkdirSync(backgroundsDir, { recursive: true });
+fs.mkdirSync(backupsDir, { recursive: true });
 
 export const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -105,7 +110,7 @@ db.exec(`
     name TEXT NOT NULL,
     location TEXT NOT NULL DEFAULT 'Local VPS',
     fqdn TEXT NOT NULL,
-    daemon_port INTEGER NOT NULL DEFAULT 3000,
+    daemon_port INTEGER NOT NULL DEFAULT 6767,
     token_prefix TEXT NOT NULL,
     token_hash TEXT NOT NULL UNIQUE,
     is_local INTEGER NOT NULL DEFAULT 0,
@@ -358,10 +363,11 @@ const localNodeCount = db
 if (localNodeCount.count === 0) {
   db.prepare(
     `INSERT INTO nodes (id, name, location, fqdn, daemon_port, token_prefix, token_hash, is_local, status, last_seen_at)
-     VALUES (1, 'Primary Node #1', 'Local VPS Host', '127.0.0.1', 3000, 'local_primary', 'local_primary_node', 1, 'online', datetime('now'))`
+     VALUES (1, 'Primary Node #1', 'Local VPS Host', '127.0.0.1', 6767, 'local_primary', 'local_primary_node', 1, 'online', datetime('now'))`
   ).run();
 }
 db.exec(`
+  UPDATE nodes SET daemon_port = 6767 WHERE is_local = 1 AND daemon_port = 3000;
   UPDATE minecraft_servers SET node_id = 1 WHERE node_id IS NULL;
   UPDATE vm_instances SET node_id = 1 WHERE node_id IS NULL;
 `);
@@ -457,6 +463,10 @@ const defaultSettings: Array<[string, string]> = [
   ['vps_reboot_warning', ''],
   ['openai_api_key_enc', ''],
   ['openai_model', 'gpt-4o-mini'],
+  ['ui_theme', 'cyber-purple'],
+  ['custom_bg_url', ''],
+  ['custom_bg_type', 'none'],
+  ['custom_bg_opacity', '0.35'],
 ];
 
 const insertSettingStmt = db.prepare(
@@ -473,6 +483,18 @@ export function getDataDir(): string {
 
 export function getDbPath(): string {
   return dbPath;
+}
+
+export function getUploadsDir(): string {
+  return uploadsDir;
+}
+
+export function getBackgroundsDir(): string {
+  return backgroundsDir;
+}
+
+export function getBackupsDir(): string {
+  return backupsDir;
 }
 
 export function getAllSettings(): Record<string, string> {

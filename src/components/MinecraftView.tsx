@@ -34,7 +34,7 @@ import {
 } from 'lucide-react';
 import { type ChangeEvent, type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import type { Socket } from 'socket.io-client';
-import { apiDownloadFile, apiFetch, formatBytes } from '../lib/api';
+import { apiDownloadFile, apiFetch, copyToClipboard, formatBytes } from '../lib/api';
 import type {
   AllocationItem,
   AuthUser,
@@ -343,6 +343,7 @@ export function MinecraftView({
     socket.emit('mc:attach', { serverId: selectedServer.id });
     return () => {
       socket.off('mc:console:data', handleConsoleData);
+      socket.emit('mc:detach');
     };
   }, [socket, selectedServer?.id, activeTab]);
 
@@ -544,12 +545,17 @@ export function MinecraftView({
   }
 
   function copyAddress(text: string, key: string | number) {
-    void navigator.clipboard.writeText(text);
-    setCopiedAddressId(key);
-    onNotify(`Copied ${text}`);
-    setTimeout(() => {
-      setCopiedAddressId((curr) => (curr === key ? null : curr));
-    }, 1800);
+    void copyToClipboard(text).then((ok) => {
+      if (ok) {
+        setCopiedAddressId(key);
+        onNotify(`Copied ${text}`);
+        setTimeout(() => {
+          setCopiedAddressId((curr) => (curr === key ? null : curr));
+        }, 1800);
+      } else {
+        onNotify('Clipboard unavailable in this browser context.', 'error');
+      }
+    });
   }
 
   async function handleCreateServerAllocation(e: FormEvent) {

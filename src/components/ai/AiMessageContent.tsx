@@ -1,5 +1,6 @@
 import { Check, Copy } from 'lucide-react';
 import { type ReactNode, useState } from 'react';
+import { copyToClipboard } from '../../lib/api';
 
 interface AiMessageContentProps {
   content: string;
@@ -91,12 +92,10 @@ function CodeBlock({ code, lang }: { code: string; lang: string }) {
   const [copied, setCopied] = useState(false);
 
   async function handleCopy() {
-    try {
-      await navigator.clipboard.writeText(code);
+    const ok = await copyToClipboard(code);
+    if (ok) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1800);
-    } catch {
-      // ignore clipboard errors
     }
   }
 

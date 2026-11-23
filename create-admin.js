@@ -5,6 +5,7 @@
  */
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
+import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -46,6 +47,8 @@ db.exec(`
     email TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('owner', 'admin', 'user')),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('pending', 'active', 'suspended')),
+    registration_ip TEXT NOT NULL DEFAULT '',
     is_suspended INTEGER NOT NULL DEFAULT 0,
     totp_secret TEXT,
     totp_enabled INTEGER NOT NULL DEFAULT 0,
@@ -59,6 +62,17 @@ db.exec(`
   );
 `);
 
+const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+if (!cols.includes('status')) {
+  db.exec("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+}
+if (!cols.includes('registration_ip')) {
+  db.exec("ALTER TABLE users ADD COLUMN registration_ip TEXT NOT NULL DEFAULT ''");
+}
+if (!cols.includes('is_suspended')) {
+  db.exec('ALTER TABLE users ADD COLUMN is_suspended INTEGER NOT NULL DEFAULT 0');
+}
+
 const passwordHash = bcrypt.hashSync(password, 12);
 
 const existing = db
@@ -68,14 +82,14 @@ const existing = db
 if (existing) {
   db.prepare(
     `UPDATE users
-     SET username = ?, email = ?, password_hash = ?, role = 'owner', is_suspended = 0
+     SET username = ?, email = ?, password_hash = ?, role = 'owner', status = 'active', is_suspended = 0
      WHERE id = ?`
   ).run(username.trim(), email.trim().toLowerCase(), passwordHash, existing.id);
   console.log(`Updated owner account '${username}' (${email}) in ${dbPath}`);
 } else {
   db.prepare(
-    `INSERT INTO users (username, email, password_hash, role)
-     VALUES (?, ?, ?, 'owner')`
+    `INSERT INTO users (username, email, password_hash, role, status, is_suspended)
+     VALUES (?, ?, ?, 'owner', 'active', 0)`
   ).run(username.trim(), email.trim().toLowerCase(), passwordHash);
   console.log(`Created owner account '${username}' (${email}) in ${dbPath}`);
 }

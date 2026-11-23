@@ -58,8 +58,20 @@ export function TerminalView({
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
     term.open(el);
-    fitAddon.fit();
-    onResizeRef.current?.(term.cols, term.rows);
+    try {
+      fitAddon.fit();
+      onResizeRef.current?.(term.cols, term.rows);
+    } catch {
+      // Initial mount inside hidden container; ResizeObserver will fit once visible
+    }
+    const rafId = requestAnimationFrame(() => {
+      try {
+        fitAddon.fit();
+        onResizeRef.current?.(term.cols, term.rows);
+      } catch {
+        // ignore
+      }
+    });
 
     const disposable = term.onData((chunk) => {
       if (interactive) {
@@ -84,6 +96,7 @@ export function TerminalView({
     );
 
     return () => {
+      cancelAnimationFrame(rafId);
       observer.disconnect();
       disposable.dispose();
       term.dispose();

@@ -65,6 +65,20 @@ export interface NodeItem {
   created_at: string;
 }
 
+export type UiThemeId =
+  | 'cyber-purple'
+  | 'emerald-matrix'
+  | 'crimson-core'
+  | 'ocean-cyan'
+  | 'amber-gold';
+
+export interface PanelAppearance {
+  theme: UiThemeId;
+  bgUrl: string;
+  bgType: 'none' | 'image' | 'gif' | 'video';
+  bgOpacity: number;
+}
+
 export interface PanelBranding {
   panelName: string;
   panelSubtitle: string;
@@ -435,6 +449,10 @@ export interface PanelSettings {
   openai_model?: string;
   openai_configured?: string;
   openai_source?: string;
+  ui_theme?: UiThemeId | string;
+  custom_bg_url?: string;
+  custom_bg_type?: 'none' | 'image' | 'gif' | 'video' | string;
+  custom_bg_opacity?: string;
 }
 
 export type AiAgentType = 'minecraft' | 'vps';

@@ -19,7 +19,7 @@ import {
 } from 'lucide-react';
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import type { Socket } from 'socket.io-client';
-import { apiFetch } from '../lib/api';
+import { apiFetch, copyToClipboard } from '../lib/api';
 import type { AllocationItem, AuthUser, NodeItem } from '../types';
 
 interface NodesViewProps {
@@ -1118,8 +1118,9 @@ export function NodesView({
                 <button
                   type="button"
                   onClick={() => {
-                    void navigator.clipboard.writeText(buildInstallCommand(tokenReveal.rawToken));
-                    setCopiedCmd(true);
+                    void copyToClipboard(buildInstallCommand(tokenReveal.rawToken)).then((ok) => {
+                      if (ok) setCopiedCmd(true);
+                    });
                   }}
                   className="inline-flex items-center gap-1 rounded border border-violet-500/35 px-2.5 py-1 text-xs font-medium text-violet-200 hover:bg-violet-600/20"
                 >
@@ -1141,8 +1142,9 @@ export function NodesView({
                 <button
                   type="button"
                   onClick={() => {
-                    void navigator.clipboard.writeText(tokenReveal.rawToken);
-                    setCopiedTok(true);
+                    void copyToClipboard(tokenReveal.rawToken).then((ok) => {
+                      if (ok) setCopiedTok(true);
+                    });
                   }}
                   className="inline-flex items-center gap-1 rounded border border-violet-500/35 px-2.5 py-1 text-xs font-medium text-violet-200 hover:bg-violet-600/20"
                 >

@@ -167,6 +167,39 @@ export function resolveOpenAiConfig(): {
   return { apiKey: '', model, source: 'none' };
 }
 
+function formatOpenAiError(err: unknown): Error {
+  const anyErr = err as {
+    status?: number;
+    code?: string;
+    name?: string;
+    message?: string;
+  };
+  const status = anyErr?.status;
+  const code = anyErr?.code || '';
+  const name = anyErr?.name || '';
+  const msg = anyErr?.message || (err instanceof Error ? err.message : 'OpenAI API request failed.');
+
+  if (status === 401 || code === 'invalid_api_key') {
+    return new Error('Invalid or expired OpenAI API key. Verify OPENAI_API_KEY in Owner Settings or .env.');
+  }
+  if (status === 429 || code === 'insufficient_quota' || code === 'rate_limit_exceeded') {
+    return new Error('OpenAI rate limit or billing quota exceeded. Check usage limits on platform.openai.com.');
+  }
+  if (status === 404 || code === 'model_not_found') {
+    return new Error('Selected OpenAI model is unavailable for this API key. Choose another model in Settings.');
+  }
+  if (
+    name === 'AbortError' ||
+    name === 'APIConnectionTimeoutError' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNRESET' ||
+    msg.toLowerCase().includes('timeout')
+  ) {
+    return new Error('OpenAI API request timed out or could not reach api.openai.com. Please try again.');
+  }
+  return new Error(`OpenAI API error: ${msg}`);
+}
+
 export async function testOpenAiConnection(params?: {
   apiKey?: string;
   model?: string;
@@ -187,12 +220,20 @@ export async function testOpenAiConnection(params?: {
   const started = Date.now();
   try {
     await client.models.retrieve(candidateModel);
-  } catch {
-    await client.chat.completions.create({
-      model: candidateModel,
-      max_tokens: 5,
-      messages: [{ role: 'user', content: 'ping' }],
-    });
+  } catch (err) {
+    const status = (err as { status?: number })?.status;
+    if (status === 401 || status === 429) {
+      throw formatOpenAiError(err);
+    }
+    try {
+      await client.chat.completions.create({
+        model: candidateModel,
+        max_tokens: 5,
+        messages: [{ role: 'user', content: 'ping' }],
+      });
+    } catch (innerErr) {
+      throw formatOpenAiError(innerErr);
+    }
   }
   const latencyMs = Date.now() - started;
 
@@ -1414,144 +1455,151 @@ export async function runAgentChat(params: {
   const pendingActions: AiToolAction[] = [];
   let finalReply = '';
 
-  for (let round = 0; round < 4; round += 1) {
-    const completion = await openai.chat.completions.create({
-      model,
-      messages,
-      tools,
-      tool_choice: 'auto',
-      temperature: 0.35,
-    });
-
-    const choice = completion.choices[0]?.message;
-    if (!choice) break;
-
-    const toolCalls = choice.tool_calls || [];
-    if (toolCalls.length === 0) {
-      finalReply = (choice.content || '').trim();
-      break;
-    }
-
-    messages.push({
-      role: 'assistant',
-      content: choice.content || null,
-      tool_calls: toolCalls,
-    });
-
-    let deferredToUserApproval = false;
-
-    for (const tc of toolCalls) {
-      if (tc.type !== 'function') continue;
-      const toolName = tc.function.name;
-      let parsedArgs: Record<string, unknown> = {};
-      try {
-        parsedArgs = tc.function.arguments ? (JSON.parse(tc.function.arguments) as Record<string, unknown>) : {};
-      } catch {
-        parsedArgs = {};
-      }
-
-      const meta = describeToolAction(params.agentType, toolName, parsedArgs);
-      const actionId = `act_${crypto.randomBytes(5).toString('hex')}`;
-      const canAutoRun =
-        meta.isReadOnly || (params.confirmationMode === 'auto' && meta.riskLevel === 'safe');
-
-      if (!canAutoRun) {
-        pendingActions.push({
-          id: actionId,
-          toolName,
-          title: meta.title,
-          description: meta.description,
-          args: parsedArgs,
-          status: 'pending',
-          riskLevel: meta.riskLevel,
-        });
-        deferredToUserApproval = true;
-        messages.push({
-          role: 'tool',
-          tool_call_id: tc.id,
-          content: JSON.stringify({
-            queued_for_approval: true,
-            actionId,
-            title: meta.title,
-            reason:
-              meta.riskLevel === 'high'
-                ? 'High-impact action always requires explicit user approval.'
-                : 'Confirmation Mode is set to Ask Before Running.',
-          }),
-        });
-        continue;
-      }
-
-      try {
-        const res =
-          params.agentType === 'minecraft'
-            ? await executeMinecraftTool({
-                serverId: params.resourceId,
-                toolName,
-                args: parsedArgs,
-                user: params.user,
-                ipAddress: params.ipAddress,
-              })
-            : await executeVpsTool({
-                instanceId: params.resourceId,
-                toolName,
-                args: parsedArgs,
-                user: params.user,
-                ipAddress: params.ipAddress,
-              });
-
-        executedActions.push({
-          id: actionId,
-          toolName,
-          title: meta.title,
-          description: meta.description,
-          args: parsedArgs,
-          status: 'executed',
-          riskLevel: meta.riskLevel,
-          summary: res.summary,
-          output: res.output,
-          executedAt: new Date().toISOString(),
-        });
-
-        messages.push({
-          role: 'tool',
-          tool_call_id: tc.id,
-          content: JSON.stringify({ ok: true, summary: res.summary, output: res.output.slice(0, 6000) }),
-        });
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : 'Tool execution failed.';
-        executedActions.push({
-          id: actionId,
-          toolName,
-          title: meta.title,
-          description: meta.description,
-          args: parsedArgs,
-          status: 'failed',
-          riskLevel: meta.riskLevel,
-          error: errMsg,
-          executedAt: new Date().toISOString(),
-        });
-
-        messages.push({
-          role: 'tool',
-          tool_call_id: tc.id,
-          content: JSON.stringify({ ok: false, error: errMsg }),
-        });
-      }
-    }
-
-    if (deferredToUserApproval) {
-      // Ask model for a crisp final explanation referencing the pending action cards
-      const follow = await openai.chat.completions.create({
+  try {
+    for (let round = 0; round < 4; round += 1) {
+      const completion = await openai.chat.completions.create({
         model,
         messages,
+        tools,
+        tool_choice: 'auto',
         temperature: 0.35,
       });
-      finalReply =
-        (follow.choices[0]?.message?.content || '').trim() ||
-        'I prepared the requested action(s) below. Click **Approve** to execute or **Reject** to cancel.';
-      break;
+
+      const choice = completion.choices[0]?.message;
+      if (!choice) break;
+
+      const toolCalls = choice.tool_calls || [];
+      if (toolCalls.length === 0) {
+        finalReply = (choice.content || '').trim();
+        break;
+      }
+
+      messages.push({
+        role: 'assistant',
+        content: choice.content || null,
+        tool_calls: toolCalls,
+      });
+
+      let deferredToUserApproval = false;
+
+      for (const tc of toolCalls) {
+        if (tc.type !== 'function') continue;
+        const toolName = tc.function.name;
+        let parsedArgs: Record<string, unknown> = {};
+        try {
+          parsedArgs = tc.function.arguments ? (JSON.parse(tc.function.arguments) as Record<string, unknown>) : {};
+        } catch {
+          parsedArgs = {};
+        }
+
+        const meta = describeToolAction(params.agentType, toolName, parsedArgs);
+        const actionId = `act_${crypto.randomBytes(5).toString('hex')}`;
+        const canAutoRun =
+          meta.isReadOnly || (params.confirmationMode === 'auto' && meta.riskLevel === 'safe');
+
+        if (!canAutoRun) {
+          pendingActions.push({
+            id: actionId,
+            toolName,
+            title: meta.title,
+            description: meta.description,
+            args: parsedArgs,
+            status: 'pending',
+            riskLevel: meta.riskLevel,
+          });
+          deferredToUserApproval = true;
+          messages.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            content: JSON.stringify({
+              queued_for_approval: true,
+              actionId,
+              title: meta.title,
+              reason:
+                meta.riskLevel === 'high'
+                  ? 'High-impact action always requires explicit user approval.'
+                  : 'Confirmation Mode is set to Ask Before Running.',
+            }),
+          });
+          continue;
+        }
+
+        try {
+          const res =
+            params.agentType === 'minecraft'
+              ? await executeMinecraftTool({
+                  serverId: params.resourceId,
+                  toolName,
+                  args: parsedArgs,
+                  user: params.user,
+                  ipAddress: params.ipAddress,
+                })
+              : await executeVpsTool({
+                  instanceId: params.resourceId,
+                  toolName,
+                  args: parsedArgs,
+                  user: params.user,
+                  ipAddress: params.ipAddress,
+                });
+
+          executedActions.push({
+            id: actionId,
+            toolName,
+            title: meta.title,
+            description: meta.description,
+            args: parsedArgs,
+            status: 'executed',
+            riskLevel: meta.riskLevel,
+            summary: res.summary,
+            output: res.output,
+            executedAt: new Date().toISOString(),
+          });
+
+          messages.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            content: JSON.stringify({ ok: true, summary: res.summary, output: res.output.slice(0, 6000) }),
+          });
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : 'Tool execution failed.';
+          executedActions.push({
+            id: actionId,
+            toolName,
+            title: meta.title,
+            description: meta.description,
+            args: parsedArgs,
+            status: 'failed',
+            riskLevel: meta.riskLevel,
+            error: errMsg,
+            executedAt: new Date().toISOString(),
+          });
+
+          messages.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            content: JSON.stringify({ ok: false, error: errMsg }),
+          });
+        }
+      }
+
+      if (deferredToUserApproval) {
+        // Ask model for a crisp final explanation referencing the pending action cards
+        const follow = await openai.chat.completions.create({
+          model,
+          messages,
+          temperature: 0.35,
+        });
+        finalReply =
+          (follow.choices[0]?.message?.content || '').trim() ||
+          'I prepared the requested action(s) below. Click **Approve** to execute or **Reject** to cancel.';
+        break;
+      }
     }
+  } catch (err) {
+    if (executedActions.length === 0 && pendingActions.length === 0) {
+      db.prepare('DELETE FROM ai_chat_history WHERE id = ?').run(userMessage.id);
+    }
+    throw formatOpenAiError(err);
   }
 
   if (!finalReply) {

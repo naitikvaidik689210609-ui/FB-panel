@@ -504,18 +504,52 @@ export async function prepareContainerDownload(params: {
       );
       const out = fs.createWriteStream(tarGzPath);
       let stderr = '';
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try {
+          proc.kill('SIGTERM');
+        } catch {
+          // ignore
+        }
+        out.destroy();
+        reject(new Error('Container archive preparation timed out.'));
+      }, 120000);
+
+      const finish = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) {
+          try {
+            proc.kill('SIGTERM');
+          } catch {
+            // ignore
+          }
+          out.destroy();
+          reject(err);
+        } else {
+          resolve();
+        }
+      };
+
       proc.stdout.pipe(out);
       proc.stderr.on('data', (d) => {
         stderr += d.toString();
       });
-      proc.on('error', reject);
-      out.on('error', reject);
-      out.on('finish', () => {
-        // Wait for proc close before resolving
-      });
+      proc.on('error', (err) => finish(err));
+      out.on('error', (err) => finish(err));
       proc.on('close', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(stderr.trim() || `tar exited with code ${code}`));
+        if (code === 0) {
+          if (out.writableFinished) {
+            finish();
+          } else {
+            out.once('finish', () => finish());
+          }
+        } else {
+          finish(new Error(stderr.trim() || `tar exited with code ${code}`));
+        }
       });
     });
 

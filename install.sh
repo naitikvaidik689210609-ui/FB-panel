@@ -9,6 +9,7 @@ INSTALL_DIR="/opt/fbbahi-panel"
 SERVICE_NAME="fbbahi-panel.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 BACKUP_DIR="/var/backups/fbbahi-panel"
+PANEL_PORT="6767"
 REPO_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PURPLE="\033[1;35m"
@@ -41,9 +42,9 @@ EOF
 install_system_packages() {
   echo -e "${CYAN}[1/5] Updating apt packages and installing prerequisites...${RESET}"
   apt-get update -y
-  apt-get install -y curl wget git ca-certificates gnupg lsb-release sqlite3 build-essential python3 rsync
+  apt-get install -y curl wget git ca-certificates gnupg lsb-release sqlite3 build-essential python3 make g++ rsync
 
-  if ! command -v node >/dev/null 2>&1 || [[ "$(node -v | sed 's/v//' | cut -d. -f1)" -lt 20 ]]; then
+  if ! command -v node >/dev/null 2>&1 || [[ "$(node -v | sed 's/v//' | cut -d. -f1)" -lt 18 ]]; then
     echo -e "${CYAN}[2/5] Installing Node.js 20.x LTS...${RESET}"
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
     apt-get install -y nodejs
@@ -82,27 +83,73 @@ install_system_packages() {
 
 deploy_application_files() {
   echo -e "${CYAN}[5/5] Deploying panel files to ${INSTALL_DIR}...${RESET}"
-  mkdir -p "${INSTALL_DIR}" "${INSTALL_DIR}/data/servers/mc"
-  rsync -a --exclude 'node_modules' --exclude 'data' --exclude '.git' "${REPO_SOURCE_DIR}/" "${INSTALL_DIR}/"
+  mkdir -p "${INSTALL_DIR}" "${INSTALL_DIR}/data/servers/mc" "${INSTALL_DIR}/data/servers/vm-backups" "${INSTALL_DIR}/uploads/backgrounds" "${INSTALL_DIR}/backups"
+  rsync -a --exclude 'node_modules' --exclude 'data' --exclude 'uploads' --exclude 'backups' --exclude 'dist' --exclude 'server.js' --exclude '*.db*' --exclude '.env' --exclude '.git' "${REPO_SOURCE_DIR}/" "${INSTALL_DIR}/"
 
   if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
     local jwt_secret
     jwt_secret="$(openssl rand -hex 32)"
     cat > "${INSTALL_DIR}/.env" <<EOF
 NODE_ENV=production
-PORT=3000
+PORT=${PANEL_PORT}
 DB_PATH=${INSTALL_DIR}/data/panel.db
 DATA_DIR=${INSTALL_DIR}/data/servers
 DOCKER_SOCKET=/var/run/docker.sock
 JWT_SECRET=${jwt_secret}
 EOF
     chmod 600 "${INSTALL_DIR}/.env"
+  else
+    if grep -q '^PORT=' "${INSTALL_DIR}/.env"; then
+      sed -i "s/^PORT=.*/PORT=${PANEL_PORT}/" "${INSTALL_DIR}/.env"
+    else
+      echo "PORT=${PANEL_PORT}" >> "${INSTALL_DIR}/.env"
+    fi
   fi
 
   pushd "${INSTALL_DIR}" >/dev/null
   npm install
   npm run build
   popd >/dev/null
+}
+
+configure_firewall_port() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    echo -e "${CYAN}[Firewall] Allowing port ${PANEL_PORT}/tcp in UFW...${RESET}"
+    ufw allow "${PANEL_PORT}/tcp" >/dev/null 2>&1 || true
+  fi
+}
+
+detect_public_ip() {
+  local pub_ip=""
+  pub_ip="$(curl -4 -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
+  if [[ -z "${pub_ip}" ]]; then
+    pub_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  echo "${pub_ip:-127.0.0.1}"
+}
+
+verify_panel_live() {
+  local live=0
+  local i
+  for i in $(seq 1 15); do
+    if curl -fsS --max-time 2 "http://127.0.0.1:${PANEL_PORT}/api/auth/status" >/dev/null 2>&1; then
+      live=1
+      break
+    fi
+    sleep 1
+  done
+
+  local public_ip
+  public_ip="$(detect_public_ip)"
+
+  if [[ "${live}" -eq 1 ]]; then
+    echo -e "\n${GREEN}[LIVE] FB BAHI Panel is listening on port ${PANEL_PORT}!${RESET}"
+    echo -e "${GREEN}       Open: http://${public_ip}:${PANEL_PORT}${RESET}"
+  else
+    echo -e "\n${YELLOW}[Warning] Service started, but port ${PANEL_PORT} did not respond within 15s.${RESET}"
+    echo -e "${YELLOW}          Check logs with: journalctl -u ${SERVICE_NAME} -n 50 --no-pager${RESET}"
+    echo -e "${CYAN}          Expected URL: http://${public_ip}:${PANEL_PORT}${RESET}"
+  fi
 }
 
 write_systemd_service() {
@@ -116,6 +163,7 @@ Wants=docker.service
 Type=simple
 User=root
 WorkingDirectory=${INSTALL_DIR}
+Environment=PORT=${PANEL_PORT}
 EnvironmentFile=${INSTALL_DIR}/.env
 ExecStart=/usr/bin/node ${INSTALL_DIR}/server.js
 Restart=always
@@ -126,9 +174,11 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
+  configure_firewall_port
   systemctl daemon-reload
   systemctl enable "${SERVICE_NAME}"
   systemctl restart "${SERVICE_NAME}"
+  verify_panel_live
 }
 
 create_admin_interactive() {
@@ -158,7 +208,6 @@ action_install() {
   install_system_packages
   deploy_application_files
   write_systemd_service
-  echo -e "\n${GREEN}[Success] FB BAHI Panel is running on http://$(hostname -I | awk '{print $1}'):3000${RESET}"
   read -rp "Create the first Owner/Admin user now? [Y/n]: " create_now
   if [[ ! "${create_now}" =~ ^[Nn]$ ]]; then
     create_admin_interactive || true
@@ -211,13 +260,16 @@ action_update() {
   if [[ -d ".git" ]]; then
     git pull --ff-only
   else
-    rsync -a --exclude 'node_modules' --exclude 'data' --exclude '.env' "${REPO_SOURCE_DIR}/" "${INSTALL_DIR}/"
+    rsync -a --exclude 'node_modules' --exclude 'data' --exclude 'uploads' --exclude 'backups' --exclude 'dist' --exclude 'server.js' --exclude '*.db*' --exclude '.env' --exclude '.git' "${REPO_SOURCE_DIR}/" "${INSTALL_DIR}/"
   fi
-  npm install --omit=dev
-  npm run build || true
+  mkdir -p "${INSTALL_DIR}/data/servers/mc" "${INSTALL_DIR}/data/servers/vm-backups" "${INSTALL_DIR}/uploads/backgrounds" "${INSTALL_DIR}/backups"
+  npm install
+  npm run build
   popd >/dev/null
 
+  configure_firewall_port
   systemctl restart "${SERVICE_NAME}"
+  verify_panel_live
   echo -e "${GREEN}[Success] FB BAHI Panel updated and restarted.${RESET}"
 }
 

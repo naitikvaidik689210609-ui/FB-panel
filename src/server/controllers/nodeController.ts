@@ -390,7 +390,7 @@ import Docker from 'dockerode';
 import { io } from 'socket.io-client';
 
 const execFileAsync = promisify(execFile);
-const PANEL_URL = process.env.PANEL_URL || 'http://localhost:3000';
+const PANEL_URL = process.env.PANEL_URL || 'http://localhost:6767';
 const NODE_TOKEN = process.env.NODE_TOKEN || '';
 const DATA_DIR = process.env.DATA_DIR || '/var/lib/fbbahi-agent/mc';
 const docker = new Docker({ socketPath: process.env.DOCKER_SOCKET || '/var/run/docker.sock' });
@@ -456,7 +456,11 @@ socket.on('connect', () => {
 
 setInterval(async () => {
   if (socket.connected) {
-    socket.emit('node:metrics', await collectMetrics());
+    try {
+      socket.emit('node:metrics', await collectMetrics());
+    } catch (err) {
+      console.error('[FB BAHI Agent] Metrics collection error:', err && err.message ? err.message : err);
+    }
   }
 }, 3000);
 
