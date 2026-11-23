@@ -1,8 +1,9 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import type { NextFunction, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
-import { db, getAllSettings } from './db.js';
+import { db, getAllSettings, getDbPath } from './db.js';
 
 const JWT_SECRET =
   process.env.JWT_SECRET && process.env.JWT_SECRET.trim().length >= 16
@@ -51,10 +52,15 @@ export const MINECRAFT_SOFTWARE_LIST = [
 
 export type MinecraftSoftware = (typeof MINECRAFT_SOFTWARE_LIST)[number];
 
+export const SSH_PUBLIC_KEY_REGEX =
+  /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com)\s+[A-Za-z0-9+/=]{16,}(\s+[^\r\n]{0,128})?$/;
+export const CHMOD_MODE_REGEX = /^[0-7]{3,4}$/;
+
 export const INCUS_OS_TEMPLATES: Record<string, { label: string; image: string }> = {
   'ubuntu-24.04': { label: 'Ubuntu 24.04 LTS', image: 'images:ubuntu/24.04' },
   'ubuntu-22.04': { label: 'Ubuntu 22.04 LTS', image: 'images:ubuntu/22.04' },
   'debian-12': { label: 'Debian 12 (Bookworm)', image: 'images:debian/12' },
+  'almalinux-9': { label: 'AlmaLinux 9', image: 'images:almalinux/9' },
   'alpine-3.20': { label: 'Alpine Linux 3.20', image: 'images:alpine/3.20' },
 };
 
@@ -106,6 +112,76 @@ export function resolveConfinedPath(baseDir: string, relativePath: string): stri
     throw new Error('Directory traversal blocked');
   }
   return resolved;
+}
+
+export function sanitizeContainerFilePath(rawPath: unknown, fallback = '/root'): string {
+  const str = typeof rawPath === 'string' && rawPath.trim() !== '' ? rawPath.trim() : fallback;
+  if (str.includes('\0') || /[\r\n]/.test(str)) {
+    throw new Error('Invalid characters in container file path.');
+  }
+  const prefixed = str.startsWith('/') ? str : `/${str}`;
+  const normalized = path.posix.normalize(prefixed);
+  if (!normalized.startsWith('/')) {
+    throw new Error('Container path must resolve inside root filesystem.');
+  }
+  return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
+}
+
+let cachedCipherKey: Buffer | null = null;
+function getPanelCipherKey(): Buffer {
+  if (cachedCipherKey) return cachedCipherKey;
+  if (process.env.JWT_SECRET && process.env.JWT_SECRET.trim().length >= 16) {
+    cachedCipherKey = crypto.createHash('sha256').update(process.env.JWT_SECRET.trim()).digest();
+    return cachedCipherKey;
+  }
+  const keyFile = path.join(path.dirname(getDbPath()), '.panel-key');
+  try {
+    if (fs.existsSync(keyFile)) {
+      const hex = fs.readFileSync(keyFile, 'utf8').trim();
+      if (/^[a-f0-9]{64}$/i.test(hex)) {
+        cachedCipherKey = Buffer.from(hex, 'hex');
+        return cachedCipherKey;
+      }
+    }
+    const generated = crypto.randomBytes(32);
+    fs.writeFileSync(keyFile, generated.toString('hex'), { mode: 0o600 });
+    cachedCipherKey = generated;
+    return cachedCipherKey;
+  } catch {
+    cachedCipherKey = crypto.createHash('sha256').update(JWT_SECRET).digest();
+    return cachedCipherKey;
+  }
+}
+
+export function encryptSecret(plaintext: string): string {
+  const key = getPanelCipherKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
+}
+
+export function decryptSecret(payload: string | null | undefined): string {
+  if (!payload) return '';
+  const parts = payload.split(':');
+  if (parts.length !== 3) return '';
+  try {
+    const [ivHex, tagHex, dataHex] = parts;
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      getPanelCipherKey(),
+      Buffer.from(ivHex, 'hex')
+    );
+    decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+    const dec = Buffer.concat([
+      decipher.update(Buffer.from(dataHex, 'hex')),
+      decipher.final(),
+    ]);
+    return dec.toString('utf8');
+  } catch {
+    return '';
+  }
 }
 
 export function validateDiscordWebhookUrl(rawUrl: string): boolean {

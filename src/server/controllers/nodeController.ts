@@ -460,11 +460,38 @@ setInterval(async () => {
   }
 }, 3000);
 
+function buildRemotePortConfig(allocations, fallbackPort) {
+  const list = Array.isArray(allocations) && allocations.length > 0
+    ? allocations
+    : [{ ip: '0.0.0.0', port: fallbackPort, protocol: 'TCP/UDP' }];
+  const ExposedPorts = {};
+  const PortBindings = {};
+  for (const alloc of list) {
+    const proto = String(alloc.protocol || 'TCP/UDP').toUpperCase();
+    const hostIp = alloc.ip === '0.0.0.0' ? '' : alloc.ip;
+    const hostPort = String(alloc.port);
+    if (proto === 'TCP' || proto === 'TCP/UDP' || proto === 'BOTH') {
+      const k = \`\${alloc.port}/tcp\`;
+      ExposedPorts[k] = {};
+      PortBindings[k] = PortBindings[k] || [];
+      PortBindings[k].push({ HostIp: hostIp, HostPort: hostPort });
+    }
+    if (proto === 'UDP' || proto === 'TCP/UDP' || proto === 'BOTH') {
+      const k = \`\${alloc.port}/udp\`;
+      ExposedPorts[k] = {};
+      PortBindings[k] = PortBindings[k] || [];
+      PortBindings[k].push({ HostIp: hostIp, HostPort: hostPort });
+    }
+  }
+  return { ExposedPorts, PortBindings };
+}
+
 socket.on('mc:create', async (p, cb) => {
   try {
     const dir = path.join(DATA_DIR, p.containerName);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'eula.txt'), \`eula=\${p.eulaAccepted ? 'true' : 'false'}\\n\`);
+    const { ExposedPorts, PortBindings } = buildRemotePortConfig(p.allocations, p.port);
     const container = await docker.createContainer({
       Image: 'itzg/minecraft-server:latest',
       name: p.containerName,
@@ -475,13 +502,15 @@ socket.on('mc:create', async (p, cb) => {
         \`TYPE=\${p.software}\`,
         \`VERSION=\${p.version}\`,
         \`MEMORY=\${p.ramMb}M\`,
+        \`SERVER_PORT=\${p.port}\`,
       ],
-      ExposedPorts: { '25565/tcp': {} },
+      ExposedPorts,
       HostConfig: {
         Binds: [\`\${dir}:/data\`],
-        PortBindings: { '25565/tcp': [{ HostPort: String(p.port) }] },
+        PortBindings,
         Memory: Number(p.ramMb) * 1024 * 1024,
         NanoCpus: Math.round((Number(p.cpuPercent) / 100) * 1_000_000_000),
+        RestartPolicy: { Name: 'unless-stopped' },
       },
     });
     await container.start();

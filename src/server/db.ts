@@ -279,6 +279,53 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS vm_ssh_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    public_key TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (instance_id) REFERENCES vm_instances(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_chat_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_type TEXT NOT NULL CHECK (agent_type IN ('minecraft', 'vps')),
+    resource_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content TEXT NOT NULL DEFAULT '',
+    tool_actions TEXT NOT NULL DEFAULT '[]',
+    pending_actions TEXT NOT NULL DEFAULT '[]',
+    model TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_ai_chat_lookup
+    ON ai_chat_history(agent_type, resource_id, user_id, id);
+
+  CREATE TABLE IF NOT EXISTS allocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL DEFAULT 1,
+    ip TEXT NOT NULL,
+    ip_alias TEXT,
+    port INTEGER NOT NULL,
+    protocol TEXT NOT NULL DEFAULT 'TCP/UDP' CHECK (protocol IN ('TCP/UDP', 'BOTH', 'TCP', 'UDP')),
+    server_id INTEGER,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (server_id) REFERENCES minecraft_servers(id) ON DELETE SET NULL
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_allocations_node_ip_port
+    ON allocations(node_id, ip, port);
+  CREATE INDEX IF NOT EXISTS idx_allocations_server
+    ON allocations(server_id);
+
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -291,12 +338,16 @@ addColumnIfMissing('minecraft_servers', 'owner_id', 'INTEGER');
 addColumnIfMissing('minecraft_servers', 'is_suspended', 'INTEGER NOT NULL DEFAULT 0');
 addColumnIfMissing('minecraft_servers', 'disk_mb', 'INTEGER NOT NULL DEFAULT 10240');
 addColumnIfMissing('minecraft_servers', 'node_id', 'INTEGER NOT NULL DEFAULT 1');
+addColumnIfMissing('minecraft_servers', 'max_allocations', 'INTEGER NOT NULL DEFAULT 3');
 addColumnIfMissing('minecraft_schedules', 'retention_count', 'INTEGER NOT NULL DEFAULT 7');
 addColumnIfMissing('minecraft_backups', 'cloud_provider', "TEXT NOT NULL DEFAULT 'local'");
 addColumnIfMissing('minecraft_backups', 'cloud_key', "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing('vm_instances', 'owner_id', 'INTEGER');
 addColumnIfMissing('vm_instances', 'is_suspended', 'INTEGER NOT NULL DEFAULT 0');
 addColumnIfMissing('vm_instances', 'node_id', 'INTEGER NOT NULL DEFAULT 1');
+addColumnIfMissing('vm_instances', 'ssh_port', 'INTEGER');
+addColumnIfMissing('vm_instances', 'host_ipv4', 'TEXT');
+addColumnIfMissing('vm_instances', 'encrypted_root_pass', 'TEXT');
 addColumnIfMissing('incus_backups', 'cloud_provider', "TEXT NOT NULL DEFAULT 'local'");
 addColumnIfMissing('incus_backups', 'cloud_key', "TEXT NOT NULL DEFAULT ''");
 
@@ -324,12 +375,53 @@ if (firstOwner) {
   db.prepare(`UPDATE vm_instances SET owner_id = ? WHERE owner_id IS NULL`).run(firstOwner.id);
 }
 
-// Seed default global port pool if none exist
+// Non-destructive migration: ensure every existing Minecraft server has a primary allocation row
+const legacyServers = db
+  .prepare('SELECT id, node_id, port FROM minecraft_servers')
+  .all() as Array<{ id: number; node_id: number | null; port: number }>;
+
+if (legacyServers.length > 0) {
+  db.transaction(() => {
+    for (const srv of legacyServers) {
+      const existingPrimary = db
+        .prepare('SELECT id FROM allocations WHERE server_id = ? AND is_primary = 1')
+        .get(srv.id) as { id: number } | undefined;
+      if (existingPrimary) continue;
+
+      const nodeId = srv.node_id || 1;
+      const existingSamePort = db
+        .prepare('SELECT id, server_id FROM allocations WHERE node_id = ? AND port = ? LIMIT 1')
+        .get(nodeId, srv.port) as { id: number; server_id: number | null } | undefined;
+
+      if (existingSamePort && (existingSamePort.server_id === null || existingSamePort.server_id === srv.id)) {
+        db.prepare(
+          `UPDATE allocations SET server_id = ?, is_primary = 1, notes = COALESCE(notes, 'Main Java Port') WHERE id = ?`
+        ).run(srv.id, existingSamePort.id);
+      } else {
+        db.prepare(
+          `INSERT OR IGNORE INTO allocations (node_id, ip, ip_alias, port, protocol, server_id, is_primary, notes)
+           VALUES (?, '0.0.0.0', NULL, ?, 'TCP/UDP', ?, 1, 'Main Java Port')`
+        ).run(nodeId, srv.port, srv.id);
+      }
+    }
+  })();
+}
+
+// Seed default global port pools if missing
 const poolCount = db.prepare('SELECT COUNT(*) AS count FROM port_pools').get() as { count: number };
 if (poolCount.count === 0) {
   db.prepare(
     `INSERT INTO port_pools (label, start_port, end_port, protocol) VALUES (?, ?, ?, ?)`
   ).run('Default Minecraft Range', 25565, 25650, 'tcp');
+}
+
+const incusNatPool = db
+  .prepare(`SELECT id FROM port_pools WHERE label = ?`)
+  .get('Incus Shared IPv4 NAT') as { id: number } | undefined;
+if (!incusNatPool) {
+  db.prepare(
+    `INSERT INTO port_pools (label, start_port, end_port, protocol) VALUES (?, ?, ?, ?)`
+  ).run('Incus Shared IPv4 NAT', 2200, 2999, 'both');
 }
 
 const defaultSettings: Array<[string, string]> = [
@@ -363,6 +455,8 @@ const defaultSettings: Array<[string, string]> = [
   ['smtp_pass', ''],
   ['smtp_from', ''],
   ['vps_reboot_warning', ''],
+  ['openai_api_key_enc', ''],
+  ['openai_model', 'gpt-4o-mini'],
 ];
 
 const insertSettingStmt = db.prepare(

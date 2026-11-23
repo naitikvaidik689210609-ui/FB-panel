@@ -5,21 +5,25 @@ import { useEffect, useRef } from 'react';
 interface TerminalViewProps {
   interactive?: boolean;
   onData?: (data: string) => void;
-  onReady?: (write: (chunk: string) => void, clear: () => void) => void;
+  onResize?: (cols: number, rows: number) => void;
+  onReady?: (write: (chunk: string) => void, clear: () => void, getDims?: () => { cols: number; rows: number }) => void;
   className?: string;
 }
 
 export function TerminalView({
   interactive = false,
   onData,
+  onResize,
   onReady,
   className = 'h-[400px]',
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onDataRef = useRef(onData);
+  const onResizeRef = useRef(onResize);
   const onReadyRef = useRef(onReady);
 
   onDataRef.current = onData;
+  onResizeRef.current = onResize;
   onReadyRef.current = onReady;
 
   useEffect(() => {
@@ -30,6 +34,7 @@ export function TerminalView({
       cursorBlink: interactive,
       disableStdin: !interactive,
       convertEol: true,
+      scrollback: 3000,
       fontFamily: '"JetBrains Mono", ui-monospace, monospace',
       fontSize: 13,
       lineHeight: 1.38,
@@ -54,6 +59,7 @@ export function TerminalView({
     term.loadAddon(fitAddon);
     term.open(el);
     fitAddon.fit();
+    onResizeRef.current?.(term.cols, term.rows);
 
     const disposable = term.onData((chunk) => {
       if (interactive) {
@@ -64,6 +70,7 @@ export function TerminalView({
     const observer = new ResizeObserver(() => {
       try {
         fitAddon.fit();
+        onResizeRef.current?.(term.cols, term.rows);
       } catch {
         // Ignore resize errors during unmount
       }
@@ -72,7 +79,8 @@ export function TerminalView({
 
     onReadyRef.current?.(
       (chunk: string) => term.write(chunk),
-      () => term.clear()
+      () => term.clear(),
+      () => ({ cols: term.cols, rows: term.rows })
     );
 
     return () => {

@@ -117,6 +117,21 @@ export interface LiveSystemStats {
   };
 }
 
+export interface AllocationItem {
+  id: number;
+  node_id: number;
+  ip: string;
+  ip_alias: string | null;
+  port: number;
+  protocol: 'TCP/UDP' | 'BOTH' | 'TCP' | 'UDP';
+  server_id: number | null;
+  server_name?: string | null;
+  server_status?: string | null;
+  is_primary: number;
+  notes: string | null;
+  created_at: string;
+}
+
 export interface MinecraftServer {
   id: number;
   name: string;
@@ -128,6 +143,10 @@ export interface MinecraftServer {
   cpu_percent: number;
   disk_mb: number;
   port: number;
+  max_allocations?: number;
+  primary_ip?: string | null;
+  primary_ip_alias?: string | null;
+  allocations_count?: number;
   eula_accepted: number;
   status: string;
   is_suspended: number;
@@ -258,7 +277,70 @@ export interface VmInstance {
   node_name?: string;
   node_location?: string;
   ip_address: string | null;
+  ssh_port?: number | null;
+  host_ipv4?: string | null;
   created_at: string;
+}
+
+export interface VmTelemetry {
+  instanceId: number;
+  live: boolean;
+  status: string;
+  cpuPercent: number;
+  ramUsedMb: number;
+  ramLimitMb: number;
+  swapUsedMb: number;
+  swapTotalMb: number;
+  diskUsedGb: number;
+  diskTotalGb: number;
+  netRxBytesPerSec: number;
+  netTxBytesPerSec: number;
+  netTotalRxBytes: number;
+  netTotalTxBytes: number;
+  uptimeSeconds: number;
+  kernel: string;
+  internalIp: string | null;
+  hostIpv4: string;
+  sshPort: number | null;
+  timestamp: number;
+}
+
+export interface VmSshKey {
+  id: number;
+  instance_id: number;
+  label: string;
+  public_key: string;
+  fingerprint: string;
+  created_at: string;
+}
+
+export interface VmSshDetails {
+  hostIpv4: string;
+  sshPort: number | null;
+  internalIp: string | null;
+  rootPassword: string;
+  keys: VmSshKey[];
+}
+
+export interface ProvisionProgressEvent {
+  operationId: string;
+  step: number;
+  totalSteps: number;
+  label: string;
+  status: 'running' | 'done' | 'error';
+  detail?: string;
+}
+
+export interface VpsFileEntry {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  isSymlink: boolean;
+  size: number;
+  permissions: string;
+  permissionsOctal: string;
+  owner: string;
+  modifiedAt: string;
 }
 
 export interface SnapshotItem {
@@ -349,6 +431,40 @@ export interface PanelSettings {
   cloud_rclone_remote?: string;
   cloud_rclone_folder?: string;
   cloud_auto_upload?: string;
+  openai_api_key?: string;
+  openai_model?: string;
+  openai_configured?: string;
+  openai_source?: string;
+}
+
+export type AiAgentType = 'minecraft' | 'vps';
+export type AiConfirmationMode = 'ask' | 'auto';
+
+export interface AiToolAction {
+  id: string;
+  toolName: string;
+  title: string;
+  description: string;
+  args: Record<string, unknown>;
+  status: 'pending' | 'executed' | 'rejected' | 'failed';
+  riskLevel: 'safe' | 'high';
+  summary?: string;
+  output?: string;
+  error?: string;
+  executedAt?: string;
+}
+
+export interface AiChatMessage {
+  id: number;
+  agent_type: AiAgentType;
+  resource_id: number;
+  user_id: number;
+  role: 'user' | 'assistant';
+  content: string;
+  tool_actions: AiToolAction[];
+  pending_actions: AiToolAction[];
+  model: string;
+  created_at: string;
 }
 
 export interface GlobalSearchResults {
@@ -356,3 +472,4 @@ export interface GlobalSearchResults {
   instances: Array<{ id: number; name: string; instance_name: string; type: string; os_template: string; status: string }>;
   users: Array<{ id: number; username: string; email: string; role: UserRole }>;
 }
+

@@ -1,14 +1,20 @@
 import {
+  AlertTriangle,
   Archive,
+  Bot,
+  Check,
   ChevronRight,
   Clock,
   CloudUpload,
+  Copy,
   Download,
   FileCode2,
   FilePlus,
   Folder,
   FolderPlus,
+  Network,
   Package,
+  Pencil,
   Play,
   Plus,
   RotateCcw,
@@ -19,6 +25,7 @@ import {
   ShieldAlert,
   Skull,
   Square,
+  Star,
   Trash2,
   Upload,
   UserCheck,
@@ -29,6 +36,7 @@ import { type ChangeEvent, type FormEvent, useCallback, useEffect, useRef, useSt
 import type { Socket } from 'socket.io-client';
 import { apiDownloadFile, apiFetch, formatBytes } from '../lib/api';
 import type {
+  AllocationItem,
   AuthUser,
   FileEntry,
   ManagedUser,
@@ -39,6 +47,7 @@ import type {
   ScheduleItem,
   SubUserItem,
 } from '../types';
+import { AiAssistantDrawer } from './ai/AiAssistantDrawer';
 import { CodeEditorView } from './CodeEditorView';
 import { type MetricPoint, ResourceChart } from './ResourceChart';
 import { TerminalView } from './TerminalView';
@@ -125,6 +134,7 @@ export function MinecraftView({
 }: MinecraftViewProps) {
   const [activeTab, setActiveTab] = useState<
     | 'console'
+    | 'network'
     | 'properties'
     | 'players'
     | 'backups'
@@ -144,7 +154,9 @@ export function MinecraftView({
   const [version, setVersion] = useState('1.21.4');
   const [ramMb, setRamMb] = useState(2048);
   const [cpuPercent, setCpuPercent] = useState(200);
-  const [port, setPort] = useState(25565);
+  const [availableNodeAllocs, setAvailableNodeAllocs] = useState<AllocationItem[]>([]);
+  const [primaryAllocationChoice, setPrimaryAllocationChoice] = useState<string>('auto');
+  const [additionalAllocationIds, setAdditionalAllocationIds] = useState<number[]>([]);
   const [nodeId, setNodeId] = useState<number>(1);
   const [assignOwnerId, setAssignOwnerId] = useState<number>(currentUser.id);
   const [eulaAccepted, setEulaAccepted] = useState(true);
@@ -212,11 +224,24 @@ export function MinecraftView({
   const [modSearching, setModSearching] = useState(false);
   const [installingId, setInstallingId] = useState<string | null>(null);
 
+  // Network / Allocations State
+  const [serverAllocations, setServerAllocations] = useState<AllocationItem[]>([]);
+  const [maxAllocations, setMaxAllocations] = useState<number>(3);
+  const [allocsLoading, setAllocsLoading] = useState(false);
+  const [newAllocNotes, setNewAllocNotes] = useState('');
+  const [claimingAlloc, setClaimingAlloc] = useState(false);
+  const [networkRestartRequired, setNetworkRestartRequired] = useState(false);
+  const [editingNoteId, setEditingNoteId] = useState<number | null>(null);
+  const [editingNoteVal, setEditingNoteVal] = useState('');
+  const [copiedAddressId, setCopiedAddressId] = useState<string | number | null>(null);
+
   // Admin Limits & Delete State
   const [adminOwnerId, setAdminOwnerId] = useState<number>(currentUser.id);
   const [adminRam, setAdminRam] = useState<number>(2048);
   const [adminCpu, setAdminCpu] = useState<number>(200);
+  const [adminMaxAllocations, setAdminMaxAllocations] = useState<number>(3);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [showAiDrawer, setShowAiDrawer] = useState(false);
 
   const isStaff = currentUser.role === 'owner' || currentUser.role === 'admin';
   const selectedServer = servers.find((s) => s.id === selectedId) || servers[0] || null;
@@ -238,6 +263,19 @@ export function MinecraftView({
   }, [isStaff]);
 
   useEffect(() => {
+    if (!showDeploy) return;
+    apiFetch<{ allocations: AllocationItem[] }>(`/api/nodes/${nodeId}/allocations/available`)
+      .then((res) => {
+        setAvailableNodeAllocs(res.allocations);
+        setPrimaryAllocationChoice('auto');
+        setAdditionalAllocationIds([]);
+      })
+      .catch(() => {
+        setAvailableNodeAllocs([]);
+      });
+  }, [showDeploy, nodeId]);
+
+  useEffect(() => {
     if (openDeploySignal > 0) setShowDeploy(true);
   }, [openDeploySignal]);
 
@@ -252,6 +290,7 @@ export function MinecraftView({
     setEditingFile(null);
     setConfirmDelete(false);
     setMetricPoints([]);
+    setNetworkRestartRequired(false);
     if (selectedServer) {
       setModType(
         selectedServer.software === 'FABRIC' || selectedServer.software === 'FORGE' ? 'mod' : 'plugin'
@@ -259,6 +298,7 @@ export function MinecraftView({
       setAdminOwnerId(selectedServer.owner_id || currentUser.id);
       setAdminRam(selectedServer.ram_mb);
       setAdminCpu(selectedServer.cpu_percent);
+      setAdminMaxAllocations(selectedServer.max_allocations || 3);
     }
   }, [selectedServer?.id]);
 
@@ -390,8 +430,25 @@ export function MinecraftView({
     }
   }, [selectedServer?.id, onNotify]);
 
+  const loadServerAllocations = useCallback(async () => {
+    if (!selectedServer) return;
+    setAllocsLoading(true);
+    try {
+      const res = await apiFetch<{ allocations: AllocationItem[]; maxAllocations: number }>(
+        `/api/minecraft/servers/${selectedServer.id}/allocations`
+      );
+      setServerAllocations(res.allocations);
+      setMaxAllocations(res.maxAllocations || 3);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Failed to load server allocations', 'error');
+    } finally {
+      setAllocsLoading(false);
+    }
+  }, [selectedServer?.id, onNotify]);
+
   useEffect(() => {
     if (!selectedServer) return;
+    if (activeTab === 'network') void loadServerAllocations();
     if (activeTab === 'files') void loadFiles(currentDir);
     if (activeTab === 'properties') void loadProperties();
     if (activeTab === 'players') void loadPlayers();
@@ -423,6 +480,12 @@ export function MinecraftView({
     e.preventDefault();
     setDeploying(true);
     try {
+      const primaryNumeric =
+        primaryAllocationChoice === 'auto' ? 'auto' : Number(primaryAllocationChoice);
+      const filteredAdditional = additionalAllocationIds.filter(
+        (id) => primaryNumeric === 'auto' || id !== primaryNumeric
+      );
+
       const res = await apiFetch<{
         server: MinecraftServer;
         dockerProvisioned: boolean;
@@ -435,7 +498,8 @@ export function MinecraftView({
           version,
           ramMb: Number(ramMb),
           cpuPercent: Number(cpuPercent),
-          port: Number(port),
+          primaryAllocationId: primaryNumeric,
+          additionalAllocationIds: filteredAdditional,
           nodeId: Number(nodeId || 1),
           eulaAccepted,
           ownerId: isStaff ? assignOwnerId : currentUser.id,
@@ -443,6 +507,7 @@ export function MinecraftView({
       });
       setShowDeploy(false);
       setName('');
+      setAdditionalAllocationIds([]);
       await onRefresh();
       onSelect(res.server.id);
       onNotify(res.note || `Server '${res.server.name}' deployed.`);
@@ -463,6 +528,9 @@ export function MinecraftView({
           body: JSON.stringify({ action }),
         }
       );
+      if (action === 'start' || action === 'restart') {
+        setNetworkRestartRequired(false);
+      }
       await onRefresh();
       if (res.deleted) {
         onSelect(null);
@@ -472,6 +540,101 @@ export function MinecraftView({
       }
     } catch (err) {
       onNotify(err instanceof Error ? err.message : `Failed to ${action} server`, 'error');
+    }
+  }
+
+  function copyAddress(text: string, key: string | number) {
+    void navigator.clipboard.writeText(text);
+    setCopiedAddressId(key);
+    onNotify(`Copied ${text}`);
+    setTimeout(() => {
+      setCopiedAddressId((curr) => (curr === key ? null : curr));
+    }, 1800);
+  }
+
+  async function handleCreateServerAllocation(e: FormEvent) {
+    e.preventDefault();
+    if (!selectedServer) return;
+    setClaimingAlloc(true);
+    try {
+      const res = await apiFetch<{
+        allocation: AllocationItem;
+        allocations: AllocationItem[];
+        restartRequired: boolean;
+      }>(`/api/minecraft/servers/${selectedServer.id}/allocations`, {
+        method: 'POST',
+        body: JSON.stringify({ notes: newAllocNotes.trim() || undefined }),
+      });
+      setServerAllocations(res.allocations);
+      setNewAllocNotes('');
+      if (res.restartRequired && selectedServer.status === 'running') {
+        setNetworkRestartRequired(true);
+      }
+      await onRefresh();
+      onNotify(`Assigned port ${res.allocation.ip}:${res.allocation.port} to ${selectedServer.name}.`);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Failed to create allocation', 'error');
+    } finally {
+      setClaimingAlloc(false);
+    }
+  }
+
+  async function handleSaveAllocationNote(allocId: number) {
+    if (!selectedServer) return;
+    try {
+      const res = await apiFetch<{ allocations: AllocationItem[] }>(
+        `/api/minecraft/servers/${selectedServer.id}/allocations/${allocId}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ notes: editingNoteVal.trim() || null }),
+        }
+      );
+      setServerAllocations(res.allocations);
+      setEditingNoteId(null);
+      onNotify('Allocation notes updated.');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Failed to update notes', 'error');
+    }
+  }
+
+  async function handleMakePrimaryAllocation(alloc: AllocationItem) {
+    if (!selectedServer) return;
+    try {
+      const res = await apiFetch<{
+        allocations: AllocationItem[];
+        primaryPort: number;
+        restartRequired: boolean;
+      }>(`/api/minecraft/servers/${selectedServer.id}/allocations/${alloc.id}/primary`, {
+        method: 'POST',
+      });
+      setServerAllocations(res.allocations);
+      if (res.restartRequired) {
+        setNetworkRestartRequired(true);
+      }
+      await onRefresh();
+      onNotify(
+        `Switched Primary Port to ${alloc.port} (synced server.properties). Restart container to apply.`
+      );
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Failed to set primary port', 'error');
+    }
+  }
+
+  async function handleUnassignAllocation(alloc: AllocationItem) {
+    if (!selectedServer) return;
+    try {
+      const res = await apiFetch<{ allocations: AllocationItem[]; restartRequired: boolean }>(
+        `/api/minecraft/servers/${selectedServer.id}/allocations/${alloc.id}`,
+        { method: 'DELETE' }
+      );
+      setServerAllocations(res.allocations);
+      if (res.restartRequired && selectedServer.status === 'running') {
+        setNetworkRestartRequired(true);
+      }
+      await onRefresh();
+      onNotify(`Released port ${alloc.port} back to node pool.`);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Failed to unassign allocation', 'error');
     }
   }
 
@@ -789,12 +952,18 @@ export function MinecraftView({
         method: 'PUT',
         body: JSON.stringify({
           ...(updates.applyLimits
-            ? { ownerId: adminOwnerId, ramMb: adminRam, cpuPercent: adminCpu }
+            ? {
+                ownerId: adminOwnerId,
+                ramMb: adminRam,
+                cpuPercent: adminCpu,
+                maxAllocations: adminMaxAllocations,
+              }
             : {}),
           ...(updates.isSuspended !== undefined ? { isSuspended: updates.isSuspended } : {}),
         }),
       });
       await onRefresh();
+      if (activeTab === 'network') void loadServerAllocations();
       onNotify('Server administrative configuration updated.');
     } catch (err) {
       onNotify(err instanceof Error ? err.message : 'Failed to update server', 'error');
@@ -859,7 +1028,11 @@ export function MinecraftView({
                     <span aria-hidden="true">·</span>
                     <span className="font-mono tabular-nums">{srv.version}</span>
                     <span aria-hidden="true">·</span>
-                    <span className="font-mono tabular-nums">:{srv.port}</span>
+                    <span className="font-mono tabular-nums">
+                      {srv.primary_ip_alias
+                        ? `${srv.primary_ip_alias}:${srv.port}`
+                        : `:${srv.port}`}
+                    </span>
                     {srv.node_name && (
                       <>
                         <span aria-hidden="true">·</span>
@@ -907,7 +1080,26 @@ export function MinecraftView({
                   <span aria-hidden="true">·</span>
                   <span className="font-mono tabular-nums">{selectedServer.cpu_percent}% CPU</span>
                   <span aria-hidden="true">·</span>
-                  <span className="font-mono tabular-nums">Port {selectedServer.port}</span>
+                  {(() => {
+                    const hostDisplay =
+                      selectedServer.primary_ip_alias || selectedServer.primary_ip || '0.0.0.0';
+                    const fullAddr = `${hostDisplay}:${selectedServer.port}`;
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => copyAddress(fullAddr, 'header')}
+                        className="inline-flex items-center gap-1 rounded border border-violet-500/25 bg-[#090714]/80 px-2 py-0.5 font-mono text-violet-200 hover:border-violet-400/50 tabular-nums"
+                        title="Click to copy server address"
+                      >
+                        <span>{fullAddr}</span>
+                        {copiedAddressId === 'header' ? (
+                          <Check className="h-3 w-3 text-emerald-400" />
+                        ) : (
+                          <Copy className="h-3 w-3 text-slate-400" />
+                        )}
+                      </button>
+                    );
+                  })()}
                   {selectedServer.node_name && (
                     <>
                       <span aria-hidden="true">·</span>
@@ -956,6 +1148,14 @@ export function MinecraftView({
                   <Skull className="h-3.5 w-3.5" />
                   Kill
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setShowAiDrawer(true)}
+                  className="cyber-glow-btn inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold text-white whitespace-nowrap shrink-0"
+                >
+                  <Bot className="h-3.5 w-3.5" />
+                  MC AI Assistant
+                </button>
               </div>
             </div>
 
@@ -964,6 +1164,7 @@ export function MinecraftView({
               {(
                 [
                   ['console', 'Console & Graph'],
+                  ['network', 'Network'],
                   ['properties', 'Properties UI'],
                   ['players', 'Players'],
                   ['backups', 'Backups'],
@@ -1021,6 +1222,226 @@ export function MinecraftView({
                   ramLimitMb={selectedServer.ram_mb}
                   live={metricLive}
                 />
+              </div>
+            )}
+
+            {/* TAB 1B: NETWORK & PORT ALLOCATIONS */}
+            {activeTab === 'network' && (
+              <div className="space-y-5">
+                {networkRestartRequired && (
+                  <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
+                    <div className="flex items-center gap-2.5">
+                      <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0" />
+                      <span>
+                        Port allocations changed. Restart the server to recreate Docker container
+                        port bindings (<span className="font-mono">-p</span> TCP/UDP) and apply the
+                        updated <span className="font-mono">server-port</span>.
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handlePower('restart')}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-amber-400 whitespace-nowrap shrink-0"
+                    >
+                      <RotateCw className="h-3.5 w-3.5" />
+                      Restart &amp; Apply Ports
+                    </button>
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-violet-500/20 bg-[#090714]/65 p-4">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <Network className="h-4 w-4 text-violet-400" />
+                      <h3 className="text-sm font-semibold text-white">
+                        Server IP &amp; Port Allocations
+                      </h3>
+                    </div>
+                    <p className="mt-1 text-xs text-slate-400">
+                      Using{' '}
+                      <strong className="font-mono text-white tabular-nums">
+                        {serverAllocations.length} / {maxAllocations}
+                      </strong>{' '}
+                      allocations on{' '}
+                      <span className="text-violet-300">
+                        {selectedServer.node_name || 'Primary Node #1'}
+                      </span>
+                    </p>
+                  </div>
+
+                  <form onSubmit={handleCreateServerAllocation} className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      value={newAllocNotes}
+                      onChange={(e) => setNewAllocNotes(e.target.value)}
+                      placeholder="Label (e.g. Geyser UDP, Voice Chat)"
+                      className="w-52 rounded-lg border border-violet-500/25 bg-[#0d0a1a] px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:border-violet-400 focus:outline-none"
+                    />
+                    <button
+                      type="submit"
+                      disabled={
+                        claimingAlloc ||
+                        (!isStaff && serverAllocations.length >= maxAllocations)
+                      }
+                      className="cyber-glow-btn inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold text-white disabled:opacity-50 whitespace-nowrap shrink-0"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      {claimingAlloc ? 'Allocating...' : 'Create Allocation'}
+                    </button>
+                  </form>
+                </div>
+
+                {allocsLoading ? (
+                  <div className="space-y-3">
+                    {Array.from({ length: 2 }).map((_, i) => (
+                      <div key={i} className="h-20 animate-pulse rounded-xl bg-violet-950/35" />
+                    ))}
+                  </div>
+                ) : serverAllocations.length === 0 ? (
+                  <div className="rounded-xl border border-violet-500/20 bg-[#090714]/50 p-8 text-center text-xs text-slate-400">
+                    No port allocations found for this server yet. Click &ldquo;Create
+                    Allocation&rdquo; above to assign one.
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {serverAllocations.map((alloc) => {
+                      const isPrimary = alloc.is_primary === 1;
+                      const displayHost = alloc.ip_alias || alloc.ip;
+                      const fullAddress = `${displayHost}:${alloc.port}`;
+                      const rawAddress = `${alloc.ip}:${alloc.port}`;
+                      const isEditingNote = editingNoteId === alloc.id;
+
+                      return (
+                        <div
+                          key={alloc.id}
+                          className={`rounded-xl border p-4 transition-colors ${
+                            isPrimary
+                              ? 'border-amber-400/45 bg-amber-500/[0.06]'
+                              : 'border-violet-500/20 bg-[#090714]/65'
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-4">
+                            <div className="flex flex-wrap items-center gap-4 min-w-0">
+                              <div className="flex items-center gap-2">
+                                {isPrimary && (
+                                  <span className="inline-flex items-center gap-1 rounded border border-amber-400/40 bg-amber-500/20 px-2 py-0.5 text-[11px] font-bold uppercase tracking-wider text-amber-200">
+                                    <Star className="h-3 w-3 fill-amber-300 text-amber-300" />
+                                    Primary
+                                  </span>
+                                )}
+                                <span className="font-mono text-base font-bold text-white tabular-nums">
+                                  {fullAddress}
+                                </span>
+                                <span className="font-mono text-[11px] text-slate-400">
+                                  {alloc.protocol}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => copyAddress(fullAddress, alloc.id)}
+                                  className="inline-flex items-center gap-1 rounded border border-violet-500/30 bg-[#0d0a1a] px-2 py-1 text-[11px] text-slate-200 hover:border-violet-400"
+                                  title="Copy connection address"
+                                >
+                                  {copiedAddressId === alloc.id ? (
+                                    <Check className="h-3 w-3 text-emerald-400" />
+                                  ) : (
+                                    <Copy className="h-3 w-3 text-slate-400" />
+                                  )}
+                                  Copy
+                                </button>
+                              </div>
+
+                              {alloc.ip_alias && (
+                                <span className="font-mono text-xs text-slate-400">
+                                  Bound IP: {rawAddress}
+                                </span>
+                              )}
+
+                              {isPrimary && (
+                                <span className="font-mono text-xs text-emerald-300">
+                                  server-port={alloc.port} synced
+                                </span>
+                              )}
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-2">
+                              {!isPrimary && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleMakePrimaryAllocation(alloc)}
+                                    className="inline-flex items-center gap-1 rounded-lg border border-amber-500/35 bg-amber-500/15 px-3 py-1.5 text-xs font-semibold text-amber-200 hover:bg-amber-500/25 whitespace-nowrap shrink-0"
+                                  >
+                                    <Star className="h-3 w-3" />
+                                    Make Primary
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleUnassignAllocation(alloc)}
+                                    className="inline-flex items-center gap-1 rounded-lg border border-red-500/35 bg-red-500/15 px-3 py-1.5 text-xs font-semibold text-red-200 hover:bg-red-500/25 whitespace-nowrap shrink-0"
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                    Unassign
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Allocation Notes Row */}
+                          <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-violet-500/10 pt-2.5 text-xs">
+                            <span className="text-slate-500">Notes:</span>
+                            {isEditingNote ? (
+                              <div className="flex items-center gap-1.5">
+                                <input
+                                  type="text"
+                                  value={editingNoteVal}
+                                  onChange={(e) => setEditingNoteVal(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      e.preventDefault();
+                                      void handleSaveAllocationNote(alloc.id);
+                                    } else if (e.key === 'Escape') {
+                                      setEditingNoteId(null);
+                                    }
+                                  }}
+                                  placeholder="e.g. Geyser UDP, Simple Voice Chat, Dynmap"
+                                  className="w-64 rounded border border-violet-500/40 bg-[#0d0a1a] px-2.5 py-1 text-xs text-white focus:outline-none"
+                                  autoFocus
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => void handleSaveAllocationNote(alloc.id)}
+                                  className="rounded bg-violet-600 px-2.5 py-1 text-[11px] font-semibold text-white"
+                                >
+                                  Save
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingNoteId(null)}
+                                  className="rounded border border-slate-700 px-2 py-1 text-[11px] text-slate-400"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setEditingNoteId(alloc.id);
+                                  setEditingNoteVal(alloc.notes || '');
+                                }}
+                                className="inline-flex items-center gap-1.5 text-slate-300 hover:text-violet-300"
+                              >
+                                <span>{alloc.notes || 'Add port note (e.g. Geyser Bedrock Port)'}</span>
+                                <Pencil className="h-3 w-3 text-violet-400" />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
 
@@ -1993,7 +2414,7 @@ export function MinecraftView({
                     <h4 className="text-sm font-semibold text-white">
                       Admin Ownership & Resource Limits
                     </h4>
-                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
                       <div>
                         <label className="mb-1 block text-xs text-slate-400">Assigned Owner</label>
                         <select
@@ -2025,6 +2446,19 @@ export function MinecraftView({
                           min={25}
                           value={adminCpu}
                           onChange={(e) => setAdminCpu(Number(e.target.value))}
+                          className="w-full rounded-lg border border-violet-500/25 bg-[#0d0a1a] px-3 py-2 font-mono text-xs text-white"
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-xs text-slate-400">
+                          Max Allocations
+                        </label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={50}
+                          value={adminMaxAllocations}
+                          onChange={(e) => setAdminMaxAllocations(Number(e.target.value))}
                           className="w-full rounded-lg border border-violet-500/25 bg-[#0d0a1a] px-3 py-2 font-mono text-xs text-white"
                         />
                       </div>
@@ -2188,7 +2622,7 @@ export function MinecraftView({
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div>
                   <label className="mb-1.5 block text-xs font-medium text-slate-300">RAM (MB)</label>
                   <input
@@ -2215,19 +2649,73 @@ export function MinecraftView({
                     className="w-full rounded-lg border border-violet-500/25 bg-[#090714]/90 px-3.5 py-2 font-mono text-sm text-white focus:border-violet-400 focus:outline-none"
                   />
                 </div>
-                <div>
-                  <label className="mb-1.5 block text-xs font-medium text-slate-300">Port</label>
-                  <input
-                    type="number"
-                    required
-                    min={1024}
-                    max={65535}
-                    value={port}
-                    onChange={(e) => setPort(Number(e.target.value))}
-                    className="w-full rounded-lg border border-violet-500/25 bg-[#090714]/90 px-3.5 py-2 font-mono text-sm text-white focus:border-violet-400 focus:outline-none"
-                  />
-                </div>
               </div>
+
+              <div>
+                <div className="mb-1.5 flex items-center justify-between">
+                  <label className="text-xs font-medium text-slate-300">
+                    Primary Allocation (IP:Port)
+                  </label>
+                  <span className="font-mono text-[11px] text-slate-400 tabular-nums">
+                    {availableNodeAllocs.length} pre-allocated free
+                  </span>
+                </div>
+                <select
+                  value={primaryAllocationChoice}
+                  onChange={(e) => setPrimaryAllocationChoice(e.target.value)}
+                  className="w-full rounded-lg border border-violet-500/25 bg-[#090714]/90 px-3.5 py-2 font-mono text-xs text-white"
+                >
+                  <option value="auto">Auto-Assign Next Available Port</option>
+                  {availableNodeAllocs.map((a) => (
+                    <option key={a.id} value={String(a.id)}>
+                      {a.ip_alias ? `${a.ip_alias} (${a.ip})` : a.ip}:{a.port} [{a.protocol}]
+                      {a.notes ? ` — ${a.notes}` : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {availableNodeAllocs.filter((a) => String(a.id) !== primaryAllocationChoice).length >
+                0 && (
+                <div>
+                  <label className="mb-1.5 block text-xs font-medium text-slate-300">
+                    Optional Additional Ports (Geyser, Voice Chat, Dynmap)
+                  </label>
+                  <div className="max-h-28 overflow-y-auto rounded-lg border border-violet-500/20 bg-[#090714]/80 p-2 space-y-1">
+                    {availableNodeAllocs
+                      .filter((a) => String(a.id) !== primaryAllocationChoice)
+                      .slice(0, 24)
+                      .map((a) => {
+                        const checked = additionalAllocationIds.includes(a.id);
+                        return (
+                          <label
+                            key={a.id}
+                            className="flex items-center justify-between rounded px-2 py-1 text-xs text-slate-300 hover:bg-violet-500/10"
+                          >
+                            <span className="flex items-center gap-2 font-mono">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setAdditionalAllocationIds((prev) => [...prev, a.id]);
+                                  } else {
+                                    setAdditionalAllocationIds((prev) =>
+                                      prev.filter((id) => id !== a.id)
+                                    );
+                                  }
+                                }}
+                                className="h-3.5 w-3.5 accent-violet-600"
+                              />
+                              {a.ip_alias || a.ip}:{a.port}
+                            </span>
+                            {a.notes && <span className="text-[11px] text-slate-500">{a.notes}</span>}
+                          </label>
+                        );
+                      })}
+                  </div>
+                </div>
+              )}
 
               <label className="flex items-center gap-2.5 text-sm text-slate-300">
                 <input
@@ -2314,6 +2802,24 @@ export function MinecraftView({
             </div>
           </div>
         </div>
+      )}
+
+      {selectedServer && (
+        <AiAssistantDrawer
+          open={showAiDrawer}
+          onClose={() => setShowAiDrawer(false)}
+          agentType="minecraft"
+          resourceId={selectedServer.id}
+          resourceTitle={selectedServer.name}
+          resourceSubtitle={`${selectedServer.software} ${selectedServer.version}`}
+          onNotify={onNotify}
+          onActionExecuted={() => {
+            void onRefresh();
+            void loadFiles(currentDir);
+            void loadProperties();
+            void loadPlayers();
+          }}
+        />
       )}
     </div>
   );

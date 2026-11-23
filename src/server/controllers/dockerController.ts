@@ -26,6 +26,13 @@ import {
   type UserRole,
 } from '../security.js';
 import { sendDiscordAlert } from '../webhook.js';
+import {
+  buildDockerPortConfig,
+  listServerAllocations,
+  resolvePrimaryAllocationCandidate,
+  syncServerPropertiesPort,
+  type AllocationRow,
+} from './allocationController.js';
 import { dispatchNodeCommand, getNodeById } from './nodeController.js';
 
 const require = createRequire(import.meta.url);
@@ -52,6 +59,10 @@ export interface MinecraftServerRow {
   cpu_percent: number;
   disk_mb: number;
   port: number;
+  max_allocations?: number;
+  primary_ip?: string | null;
+  primary_ip_alias?: string | null;
+  allocations_count?: number;
   eula_accepted: number;
   status: string;
   is_suspended: number;
@@ -86,10 +97,13 @@ export async function syncMinecraftStatuses(viewer?: {
     servers = db
       .prepare(
         `SELECT ms.*, u.username AS owner_username,
-                n.name AS node_name, n.location AS node_location
+                n.name AS node_name, n.location AS node_location,
+                pa.ip AS primary_ip, pa.ip_alias AS primary_ip_alias,
+                (SELECT COUNT(*) FROM allocations al WHERE al.server_id = ms.id) AS allocations_count
          FROM minecraft_servers ms
          LEFT JOIN users u ON u.id = ms.owner_id
          LEFT JOIN nodes n ON n.id = ms.node_id
+         LEFT JOIN allocations pa ON pa.server_id = ms.id AND pa.is_primary = 1
          ORDER BY ms.created_at DESC`
       )
       .all() as MinecraftServerRow[];
@@ -97,10 +111,13 @@ export async function syncMinecraftStatuses(viewer?: {
     servers = db
       .prepare(
         `SELECT DISTINCT ms.*, u.username AS owner_username,
-                n.name AS node_name, n.location AS node_location
+                n.name AS node_name, n.location AS node_location,
+                pa.ip AS primary_ip, pa.ip_alias AS primary_ip_alias,
+                (SELECT COUNT(*) FROM allocations al WHERE al.server_id = ms.id) AS allocations_count
          FROM minecraft_servers ms
          LEFT JOIN users u ON u.id = ms.owner_id
          LEFT JOIN nodes n ON n.id = ms.node_id
+         LEFT JOIN allocations pa ON pa.server_id = ms.id AND pa.is_primary = 1
          LEFT JOIN server_subusers ss ON ss.server_id = ms.id
          WHERE ms.owner_id = ? OR ss.user_id = ?
          ORDER BY ms.created_at DESC`
@@ -147,7 +164,8 @@ function initializeServerDirectory(
   serverDir: string,
   software: string,
   name: string,
-  eulaAccepted: boolean
+  eulaAccepted: boolean,
+  primaryPort = 25565
 ): void {
   fs.mkdirSync(serverDir, { recursive: true });
   const addonFolder = software === 'FABRIC' || software === 'FORGE' ? 'mods' : 'plugins';
@@ -169,7 +187,7 @@ function initializeServerDirectory(
       [
         '# Minecraft server properties',
         `motd=${name}`,
-        'server-port=25565',
+        `server-port=${primaryPort}`,
         'max-players=20',
         'online-mode=true',
         'difficulty=normal',
@@ -185,6 +203,8 @@ function initializeServerDirectory(
       ].join('\n'),
       'utf8'
     );
+  } else {
+    syncServerPropertiesPort(serverDir, primaryPort);
   }
 }
 
@@ -210,7 +230,9 @@ export async function createMinecraftServer(params: {
   ramMb: number;
   cpuPercent: number;
   diskMb?: number;
-  port: number;
+  port?: number;
+  primaryAllocationId?: number | 'auto';
+  additionalAllocationIds?: number[];
   eulaAccepted: boolean;
   ownerId: number;
   nodeId?: number;
@@ -246,10 +268,6 @@ export async function createMinecraftServer(params: {
   const diskMb = Number(params.diskMb ?? 10240);
   if (!Number.isInteger(diskMb) || diskMb < 1024 || diskMb > 512000) {
     throw new Error('Disk limit must be between 1024 MB and 512000 MB.');
-  }
-
-  if (!isValidPort(params.port)) {
-    throw new Error('Port must be an integer between 1024 and 65535.');
   }
 
   if (!params.eulaAccepted) {
@@ -288,22 +306,57 @@ export async function createMinecraftServer(params: {
     }
   }
 
-  const conflict = db
-    .prepare('SELECT id FROM port_allocations WHERE host_port = ? AND protocol = ?')
-    .get(params.port, 'tcp');
-  if (conflict) {
-    throw new Error(`Port ${params.port}/tcp is already allocated.`);
-  }
-
   const targetNodeId = params.nodeId ? Number(params.nodeId) : 1;
   const targetNode = getNodeById(targetNodeId);
   if (!targetNode) {
     throw new Error('Selected target VPS node does not exist.');
   }
 
+  const primaryCandidate = resolvePrimaryAllocationCandidate({
+    nodeId: targetNode.id,
+    primaryAllocationId: params.primaryAllocationId,
+    fallbackPort: params.port,
+  });
+  const primaryPort = primaryCandidate.port;
+  if (!isValidPort(primaryPort)) {
+    throw new Error('Primary port must be an integer between 1024 and 65535.');
+  }
+
+  const extraIds = Array.from(
+    new Set(
+      (params.additionalAllocationIds || [])
+        .map((id) => Number(id))
+        .filter((id) => Number.isInteger(id) && id > 0 && id !== primaryCandidate.existingAllocation?.id)
+    )
+  );
+
+  const additionalAllocations: AllocationRow[] = [];
+  for (const extraId of extraIds) {
+    const row = db
+      .prepare('SELECT * FROM allocations WHERE id = ? AND node_id = ?')
+      .get(extraId, targetNode.id) as AllocationRow | undefined;
+    if (!row) {
+      throw new Error('Additional allocation does not belong to the selected VPS node.');
+    }
+    if (row.server_id !== null) {
+      throw new Error(`Allocation ${row.ip}:${row.port} is already assigned.`);
+    }
+    additionalAllocations.push(row);
+  }
+
+  const dockerAllocations = [
+    {
+      ip: primaryCandidate.ip,
+      port: primaryPort,
+      protocol: primaryCandidate.existingAllocation?.protocol || 'TCP/UDP',
+    },
+    ...additionalAllocations.map((a) => ({ ip: a.ip, port: a.port, protocol: a.protocol })),
+  ];
+  const { ExposedPorts, PortBindings } = buildDockerPortConfig(dockerAllocations);
+
   const containerName = slugifyContainerName(displayName, 'mc');
   const serverDir = path.join(getDataDir(), 'mc', containerName);
-  initializeServerDirectory(serverDir, software, displayName, params.eulaAccepted);
+  initializeServerDirectory(serverDir, software, displayName, params.eulaAccepted, primaryPort);
 
   let containerId: string | null = null;
   let initialStatus = 'stopped';
@@ -320,7 +373,8 @@ export async function createMinecraftServer(params: {
         version: params.version,
         ramMb,
         cpuPercent,
-        port: params.port,
+        port: primaryPort,
+        allocations: dockerAllocations,
         eulaAccepted: params.eulaAccepted,
       },
       60000
@@ -345,13 +399,12 @@ export async function createMinecraftServer(params: {
           `VERSION=${params.version}`,
           `MEMORY=${ramMb}M`,
           `SERVER_NAME=${displayName}`,
+          `SERVER_PORT=${primaryPort}`,
         ],
-        ExposedPorts: { '25565/tcp': {} },
+        ExposedPorts,
         HostConfig: {
           Binds: [`${serverDir}:/data`],
-          PortBindings: {
-            '25565/tcp': [{ HostPort: String(params.port) }],
-          },
+          PortBindings,
           Memory: ramMb * 1024 * 1024,
           NanoCpus: Math.round((cpuPercent / 100) * 1_000_000_000),
           RestartPolicy: { Name: 'unless-stopped' },
@@ -368,11 +421,12 @@ export async function createMinecraftServer(params: {
   }
 
   const insertTx = db.transaction(() => {
+    const maxAllocDefault = Math.max(3, 1 + additionalAllocations.length);
     const result = db
       .prepare(
         `INSERT INTO minecraft_servers
-         (name, container_name, container_id, software, version, ram_mb, cpu_percent, disk_mb, port, eula_accepted, status, owner_id, node_id, data_dir)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         (name, container_name, container_id, software, version, ram_mb, cpu_percent, disk_mb, port, max_allocations, eula_accepted, status, owner_id, node_id, data_dir)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         displayName,
@@ -383,7 +437,8 @@ export async function createMinecraftServer(params: {
         ramMb,
         cpuPercent,
         diskMb,
-        params.port,
+        primaryPort,
+        maxAllocDefault,
         params.eulaAccepted ? 1 : 0,
         initialStatus,
         params.ownerId,
@@ -392,10 +447,35 @@ export async function createMinecraftServer(params: {
       );
 
     const serverId = Number(result.lastInsertRowid);
+
+    if (primaryCandidate.existingAllocation) {
+      const claimRes = db
+        .prepare(
+          `UPDATE allocations
+           SET server_id = ?, is_primary = 1, notes = COALESCE(notes, 'Main Java Port')
+           WHERE id = ? AND server_id IS NULL`
+        )
+        .run(serverId, primaryCandidate.existingAllocation.id);
+      if (claimRes.changes === 0) {
+        throw new Error('Selected primary allocation was claimed concurrently. Please retry.');
+      }
+    } else {
+      db.prepare(
+        `INSERT INTO allocations (node_id, ip, ip_alias, port, protocol, server_id, is_primary, notes)
+         VALUES (?, ?, NULL, ?, 'TCP/UDP', ?, 1, 'Main Java Port')`
+      ).run(targetNode.id, primaryCandidate.ip, primaryPort, serverId);
+    }
+
+    for (const extra of additionalAllocations) {
+      db.prepare(
+        `UPDATE allocations SET server_id = ?, is_primary = 0 WHERE id = ? AND server_id IS NULL`
+      ).run(serverId, extra.id);
+    }
+
     db.prepare(
-      `INSERT INTO port_allocations (resource_type, resource_id, host_port, target_port, protocol, device_name)
-       VALUES ('minecraft', ?, ?, 25565, 'tcp', ?)`
-    ).run(serverId, params.port, containerName);
+      `INSERT OR IGNORE INTO port_allocations (resource_type, resource_id, host_port, target_port, protocol, device_name)
+       VALUES ('minecraft', ?, ?, ?, 'tcp', ?)`
+    ).run(serverId, primaryPort, primaryPort, containerName);
 
     return serverId;
   });
@@ -404,10 +484,13 @@ export async function createMinecraftServer(params: {
   const server = db
     .prepare(
       `SELECT ms.*, u.username AS owner_username,
-              n.name AS node_name, n.location AS node_location
+              n.name AS node_name, n.location AS node_location,
+              pa.ip AS primary_ip, pa.ip_alias AS primary_ip_alias,
+              (SELECT COUNT(*) FROM allocations al WHERE al.server_id = ms.id) AS allocations_count
        FROM minecraft_servers ms
        LEFT JOIN users u ON u.id = ms.owner_id
        LEFT JOIN nodes n ON n.id = ms.node_id
+       LEFT JOIN allocations pa ON pa.server_id = ms.id AND pa.is_primary = 1
        WHERE ms.id = ?`
     )
     .get(serverId) as MinecraftServerRow;
@@ -417,7 +500,7 @@ export async function createMinecraftServer(params: {
     username: params.username,
     action: 'minecraft.create',
     target: containerName,
-    details: `${software} ${params.version} on port ${params.port} (${ramMb}MB RAM, node=${targetNode.name}, owner#${params.ownerId})`,
+    details: `${software} ${params.version} on ${primaryCandidate.ip}:${primaryPort} (${dockerAllocations.length} port(s), ${ramMb}MB RAM, node=${targetNode.name}, owner#${params.ownerId})`,
     ipAddress: params.ipAddress,
   });
 
@@ -428,13 +511,92 @@ export async function createMinecraftServer(params: {
       description: `Container \`${containerName}\` is running on node **${targetNode.name}**.`,
       fields: [
         { name: 'Software', value: `${software} ${params.version}`, inline: true },
-        { name: 'Port', value: String(params.port), inline: true },
+        { name: 'Primary Port', value: `${primaryCandidate.ip}:${primaryPort}`, inline: true },
         { name: 'Memory', value: `${ramMb} MB`, inline: true },
       ],
     });
   }
 
   return { server, dockerProvisioned, note };
+}
+
+function portBindingsMatch(
+  actual: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null> | undefined,
+  expected: Record<string, Array<{ HostIp: string; HostPort: string }>>
+): boolean {
+  const actualKeys = Object.keys(actual || {}).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  if (actualKeys.length !== expectedKeys.length) return false;
+  for (let i = 0; i < expectedKeys.length; i++) {
+    const k = expectedKeys[i];
+    if (actualKeys[i] !== k) return false;
+    const aList = (actual?.[k] || []).map((x) => `${x.HostIp || ''}:${x.HostPort || ''}`).sort();
+    const eList = expected[k].map((x) => `${x.HostIp || ''}:${x.HostPort}`).sort();
+    if (aList.length !== eList.length) return false;
+    for (let j = 0; j < eList.length; j++) {
+      if (aList[j] !== eList[j]) return false;
+    }
+  }
+  return true;
+}
+
+async function ensureContainerSyncedWithAllocations(srv: MinecraftServerRow): Promise<Docker.Container> {
+  const allocs = listServerAllocations(srv.id);
+  const effectiveAllocs =
+    allocs.length > 0
+      ? allocs
+      : [{ ip: '0.0.0.0', port: srv.port, protocol: 'TCP/UDP' }];
+  const { ExposedPorts, PortBindings } = buildDockerPortConfig(effectiveAllocs);
+
+  const container = docker.getContainer(srv.container_name);
+  let needsRecreate = false;
+
+  try {
+    const info = await container.inspect();
+    const envList = info.Config?.Env || [];
+    const hasMatchingServerPort = envList.includes(`SERVER_PORT=${srv.port}`);
+    if (!portBindingsMatch(info.HostConfig?.PortBindings, PortBindings) || !hasMatchingServerPort) {
+      needsRecreate = true;
+    }
+    if (!needsRecreate) {
+      return container;
+    }
+    if (info.State.Running) {
+      await container.stop({ t: 10 }).catch(() => {});
+    }
+    await container.remove({ force: true }).catch(() => {});
+  } catch {
+    needsRecreate = true;
+  }
+
+  const image = 'itzg/minecraft-server:latest';
+  await pullImageIfNeeded(image);
+
+  const recreated = await docker.createContainer({
+    Image: image,
+    name: srv.container_name,
+    Tty: true,
+    OpenStdin: true,
+    Env: [
+      `EULA=${srv.eula_accepted ? 'TRUE' : 'FALSE'}`,
+      `TYPE=${srv.software}`,
+      `VERSION=${srv.version}`,
+      `MEMORY=${srv.ram_mb}M`,
+      `SERVER_NAME=${srv.name}`,
+      `SERVER_PORT=${srv.port}`,
+    ],
+    ExposedPorts,
+    HostConfig: {
+      Binds: [`${srv.data_dir}:/data`],
+      PortBindings,
+      Memory: srv.ram_mb * 1024 * 1024,
+      NanoCpus: Math.round((srv.cpu_percent / 100) * 1_000_000_000),
+      RestartPolicy: { Name: 'unless-stopped' },
+    },
+  });
+
+  db.prepare('UPDATE minecraft_servers SET container_id = ? WHERE id = ?').run(recreated.id, srv.id);
+  return recreated;
 }
 
 export async function controlMinecraftServer(params: {
@@ -462,9 +624,12 @@ export async function controlMinecraftServer(params: {
         fs.rmSync(srv.data_dir, { recursive: true, force: true });
       }
       db.transaction(() => {
-        db.prepare(`DELETE FROM port_allocations WHERE resource_type = 'minecraft' AND resource_id = ?`).run(
-          srv.id
-        );
+        db.prepare(
+          'UPDATE allocations SET server_id = NULL, is_primary = 0, notes = NULL WHERE server_id = ?'
+        ).run(srv.id);
+        db.prepare(
+          `DELETE FROM port_allocations WHERE resource_type = 'minecraft' AND resource_id = ?`
+        ).run(srv.id);
         db.prepare('DELETE FROM minecraft_servers WHERE id = ?').run(srv.id);
       })();
 
@@ -482,6 +647,12 @@ export async function controlMinecraftServer(params: {
     const remoteRes = await dispatchNodeCommand<{ status?: string }>(srv.node_id, 'mc:power', {
       containerName: srv.container_name,
       action: params.action,
+      port: srv.port,
+      allocations: listServerAllocations(srv.id).map((a) => ({
+        ip: a.ip,
+        port: a.port,
+        protocol: a.protocol,
+      })),
     });
     const nextStatus =
       remoteRes.status ||
@@ -528,9 +699,12 @@ export async function controlMinecraftServer(params: {
     }
 
     db.transaction(() => {
-      db.prepare(`DELETE FROM port_allocations WHERE resource_type = 'minecraft' AND resource_id = ?`).run(
-        srv.id
-      );
+      db.prepare(
+        'UPDATE allocations SET server_id = NULL, is_primary = 0, notes = NULL WHERE server_id = ?'
+      ).run(srv.id);
+      db.prepare(
+        `DELETE FROM port_allocations WHERE resource_type = 'minecraft' AND resource_id = ?`
+      ).run(srv.id);
       db.prepare('DELETE FROM minecraft_servers WHERE id = ?').run(srv.id);
     })();
 
@@ -539,7 +713,7 @@ export async function controlMinecraftServer(params: {
       username: params.username,
       action: 'minecraft.delete',
       target: srv.container_name,
-      details: `Deleted server '${srv.name}'`,
+      details: `Deleted server '${srv.name}' and released port allocations`,
       ipAddress: params.ipAddress,
     });
 
@@ -552,11 +726,14 @@ export async function controlMinecraftServer(params: {
     );
   }
 
-  const container = docker.getContainer(srv.container_name);
   let nextStatus = srv.status;
 
   if (params.action === 'start') {
-    await container.start();
+    const container = await ensureContainerSyncedWithAllocations(srv);
+    const info = await container.inspect().catch(() => null);
+    if (!info?.State?.Running) {
+      await container.start();
+    }
     nextStatus = 'running';
     void sendDiscordAlert({
       event: 'start',
@@ -564,6 +741,7 @@ export async function controlMinecraftServer(params: {
       description: `Minecraft server \`${srv.container_name}\` started by ${params.username}.`,
     });
   } else if (params.action === 'stop') {
+    const container = docker.getContainer(srv.container_name);
     await container.stop({ t: 10 });
     nextStatus = 'stopped';
     void sendDiscordAlert({
@@ -572,7 +750,13 @@ export async function controlMinecraftServer(params: {
       description: `Minecraft server \`${srv.container_name}\` stopped by ${params.username}.`,
     });
   } else if (params.action === 'restart') {
-    await container.restart({ t: 10 });
+    const syncedContainer = await ensureContainerSyncedWithAllocations(srv);
+    const info = await syncedContainer.inspect().catch(() => null);
+    if (!info?.State?.Running) {
+      await syncedContainer.start();
+    } else {
+      await syncedContainer.restart({ t: 10 });
+    }
     nextStatus = 'running';
     void sendDiscordAlert({
       event: 'start',
@@ -580,6 +764,7 @@ export async function controlMinecraftServer(params: {
       description: `Minecraft server \`${srv.container_name}\` restarted by ${params.username}.`,
     });
   } else if (params.action === 'kill') {
+    const container = docker.getContainer(srv.container_name);
     await container.kill();
     nextStatus = 'stopped';
     void sendDiscordAlert({

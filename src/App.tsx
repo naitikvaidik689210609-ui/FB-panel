@@ -581,7 +581,15 @@ export default function App() {
           )}
 
           {activeSection === 'nodes' && isStaff && (
-            <NodesView currentUser={user} socket={socket} onNotify={notify} />
+            <NodesView
+              currentUser={user}
+              socket={socket}
+              onNotify={notify}
+              onNavigateToServer={(serverId) => {
+                setSection('minecraft');
+                setSelectedMcId(serverId);
+              }}
+            />
           )}
 
           {activeSection === 'new-members' && isStaff && (

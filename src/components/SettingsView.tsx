@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   Bell,
+  Bot,
   Check,
   Cloud,
   Copy,
@@ -80,11 +81,14 @@ export function SettingsView({
     cloud_rclone_remote: '',
     cloud_rclone_folder: 'fb-bahi-backups',
     cloud_auto_upload: '0',
+    openai_api_key: '',
+    openai_model: 'gpt-4o-mini',
   });
   const [saving, setSaving] = useState(false);
   const [testingWebhook, setTestingWebhook] = useState(false);
   const [testingTelegram, setTestingTelegram] = useState(false);
   const [testingCloud, setTestingCloud] = useState(false);
+  const [testingOpenAi, setTestingOpenAi] = useState(false);
 
   // Change password form
   const [currentPassword, setCurrentPassword] = useState('');
@@ -120,6 +124,7 @@ export function SettingsView({
         smtp_pass: sRes.settings.smtp_pass ? '********' : '',
         telegram_bot_token: sRes.settings.telegram_bot_token ? '********' : '',
         cloud_secret_key: sRes.settings.cloud_secret_key ? '********' : '',
+        openai_api_key: sRes.settings.openai_api_key ? '********' : '',
       }));
 
       if (isStaff) {
@@ -157,6 +162,7 @@ export function SettingsView({
         smtp_pass: res.settings.smtp_pass ? '********' : '',
         telegram_bot_token: res.settings.telegram_bot_token ? '********' : '',
         cloud_secret_key: res.settings.cloud_secret_key ? '********' : '',
+        openai_api_key: res.settings.openai_api_key ? '********' : '',
       }));
       onBrandingChange({
         panelName: res.settings.panel_name,
@@ -215,6 +221,24 @@ export function SettingsView({
       );
     } finally {
       setTestingCloud(false);
+    }
+  }
+
+  async function handleTestOpenAi() {
+    setTestingOpenAi(true);
+    try {
+      const res = await apiFetch<{ ok: boolean; message: string }>('/api/settings/test-openai', {
+        method: 'POST',
+        body: JSON.stringify({
+          apiKey: settings.openai_api_key,
+          model: settings.openai_model,
+        }),
+      });
+      onNotify(res.message || 'OpenAI API key verified.');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'OpenAI connection test failed', 'error');
+    } finally {
+      setTestingOpenAi(false);
     }
   }
 
@@ -851,6 +875,91 @@ export function SettingsView({
               </div>
             )}
           </div>
+
+          {/* Owner-Only AI Agents (OpenAI Integration) */}
+          {isOwner && (
+            <div className="cyber-glass rounded-xl p-6 space-y-5">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-violet-500/15 pb-4">
+                <div className="flex items-center gap-2.5">
+                  <Bot className="h-5 w-5 text-violet-400" />
+                  <div>
+                    <h2 className="text-base font-semibold text-white">
+                      AI Agents (OpenAI API Integration)
+                    </h2>
+                    <p className="text-xs text-slate-400">
+                      Powers MC AI Assistant &amp; VPS / VM AI SysAdmin ·{' '}
+                      <span className="text-slate-300">
+                        {settings.openai_configured === '1'
+                          ? `Active (${
+                              settings.openai_source === 'env' ? '.env' : 'Encrypted Vault'
+                            })`
+                          : 'Not Configured'}
+                      </span>
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleTestOpenAi()}
+                    disabled={
+                      testingOpenAi ||
+                      (!settings.openai_api_key && settings.openai_configured !== '1')
+                    }
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/35 px-3.5 py-2 text-xs font-medium text-cyan-200 hover:bg-cyan-500/15 disabled:opacity-40 whitespace-nowrap shrink-0"
+                  >
+                    <Bot className="h-3.5 w-3.5" />
+                    {testingOpenAi ? 'Testing...' : 'Test OpenAI Key'}
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={saving}
+                    className="cyber-glow-btn inline-flex items-center gap-1.5 rounded-lg px-4 py-2 text-xs font-semibold text-white whitespace-nowrap shrink-0"
+                  >
+                    <Save className="h-3.5 w-3.5" />
+                    {saving ? 'Saving...' : 'Save AI Config'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div className="md:col-span-2">
+                  <label className="mb-1.5 block text-xs font-medium text-slate-300">
+                    OpenAI API Key (Stored Encrypted on Backend · Never Sent to Browser)
+                  </label>
+                  <input
+                    type="password"
+                    value={settings.openai_api_key || ''}
+                    onChange={(e) => setSettings({ ...settings, openai_api_key: e.target.value })}
+                    placeholder={
+                      settings.openai_source === 'env'
+                        ? 'Loaded from .env (OPENAI_API_KEY) — enter key here to override'
+                        : 'sk-... (clear field & save to revert to .env)'
+                    }
+                    className="w-full rounded-lg border border-violet-500/25 bg-[#090714]/80 px-3.5 py-2 font-mono text-xs text-white placeholder-slate-500 focus:border-violet-400 focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label className="mb-1.5 block text-xs font-medium text-slate-300">
+                    OpenAI Model
+                  </label>
+                  <select
+                    value={settings.openai_model || 'gpt-4o-mini'}
+                    onChange={(e) => setSettings({ ...settings, openai_model: e.target.value })}
+                    className="w-full rounded-lg border border-violet-500/25 bg-[#090714]/80 px-3.5 py-2 text-sm text-white focus:border-violet-400 focus:outline-none"
+                  >
+                    <option value="gpt-4o-mini">gpt-4o-mini (Fast &amp; Cost-Efficient)</option>
+                    <option value="gpt-4o">gpt-4o (Flagship Reasoning)</option>
+                    <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                    <option value="gpt-4.1">gpt-4.1</option>
+                    <option value="o4-mini">o4-mini</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Owner-Only Off-Site Cloud Backup Storage */}
           {isOwner && (

@@ -14,6 +14,31 @@ import { Server as SocketIOServer } from 'socket.io';
 import { createServer as createViteServer } from 'vite';
 import { testCloudConnection } from './src/server/cloudStorage.js';
 import {
+  type AiAgentType,
+  type AiConfirmationMode,
+  ALLOWED_OPENAI_MODEL_REGEX,
+  clearAiChatHistory,
+  listAiChatHistory,
+  resolveOpenAiConfig,
+  resolvePendingAiAction,
+  runAgentChat,
+  testOpenAiConnection,
+} from './src/server/controllers/aiAgentController.js';
+import {
+  assignNextAllocationToServer,
+  bulkDeleteNodeAllocations,
+  createNodeAllocations,
+  deleteNodeAllocation,
+  getSuggestedNodeIp,
+  listAvailableNodeAllocations,
+  listNodeAllocations,
+  listServerAllocations,
+  setServerPrimaryAllocation,
+  unassignServerAllocation,
+  updateNodeAllocation,
+  updateServerAllocationNotes,
+} from './src/server/controllers/allocationController.js';
+import {
   controlMinecraftServer,
   createMinecraftBackup,
   createMinecraftServer,
@@ -44,6 +69,7 @@ import {
 } from './src/server/controllers/dockerController.js';
 import {
   addIncusPortForward,
+  addVmSshKey,
   controlIncusInstance,
   createIncusBackupOrSnapshot,
   createIncusInstance,
@@ -52,21 +78,43 @@ import {
   deleteIncusBackup,
   deleteInstanceSnapshot,
   deleteReverseProxy,
+  detectHostPublicIpv4,
   getIncusBackupArchivePath,
   getIncusInstanceMetrics,
+  getIncusInstanceTelemetry,
+  getIncusSshDetails,
+  getNextFreeSharedPort,
+  type IncusRecipeId,
   isIncusReady,
+  launchIncusSshx,
   listIncusBackupsAndSnapshots,
   listInstanceSnapshots,
   listPortAllocations,
   listReverseProxies,
   reinstallIncusInstance,
   removeIncusPortForward,
+  removeVmSshKey,
+  renameIncusInstance,
+  resetIncusRootPassword,
   restoreIncusBackup,
   restoreInstanceSnapshot,
+  runIncusAppRecipe,
+  stopIncusSshx,
   syncIncusInstances,
   uploadIncusBackupToCloud,
   type VmInstanceRow,
 } from './src/server/controllers/incusController.js';
+import {
+  chmodContainerEntry,
+  createContainerEntry,
+  deleteContainerEntry,
+  listContainerFiles,
+  prepareContainerDownload,
+  readContainerFile,
+  renameOrMoveContainerEntry,
+  uploadContainerFiles,
+  writeContainerFile,
+} from './src/server/controllers/incusFilesController.js';
 import {
   createRemoteNode,
   deleteRemoteNode,
@@ -101,6 +149,7 @@ import {
   canAccessIncusInstance,
   canAccessMinecraftServer,
   EMAIL_REGEX,
+  encryptSecret,
   getClientIp,
   getUserQuotaSummary,
   hashApiKey,
@@ -124,6 +173,8 @@ import { sendDiscordAlert, sendTelegramAlert } from './src/server/webhook.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 const isProd = process.env.NODE_ENV === 'production';
+
+let ioRef: SocketIOServer | null = null;
 
 const app = express();
 app.set('trust proxy', 1);
@@ -1253,22 +1304,166 @@ app.get('/api/nodes/agent-script', (_req, res) => {
   res.type('text/javascript').send(getNodeAgentSource());
 });
 
+app.get(
+  '/api/nodes/:id/suggested-ip',
+  requireAuth,
+  requireRole('owner', 'admin'),
+  async (req, res) => {
+    try {
+      const result = await getSuggestedNodeIp(Number(req.params.id));
+      res.json(result);
+    } catch (err) {
+      res.status(404).json({ error: err instanceof Error ? err.message : 'Node not found.' });
+    }
+  }
+);
+
+app.get(
+  '/api/nodes/:id/allocations',
+  requireAuth,
+  requireRole('owner', 'admin'),
+  (req, res) => {
+    try {
+      const allocations = listNodeAllocations(Number(req.params.id));
+      res.json({ allocations });
+    } catch (err) {
+      res.status(404).json({ error: err instanceof Error ? err.message : 'Failed to list allocations.' });
+    }
+  }
+);
+
+app.get('/api/nodes/:id/allocations/available', requireAuth, (req, res) => {
+  try {
+    const allocations = listAvailableNodeAllocations(Number(req.params.id));
+    res.json({ allocations });
+  } catch (err) {
+    res.status(404).json({ error: err instanceof Error ? err.message : 'Failed to list available allocations.' });
+  }
+});
+
+app.post(
+  '/api/nodes/:id/allocations',
+  requireAuth,
+  requireRole('owner', 'admin'),
+  (req: AuthenticatedRequest, res) => {
+    try {
+      const { ip, ipAlias, ports, protocol, notes } = req.body as {
+        ip: string;
+        ipAlias?: string;
+        ports: string;
+        protocol?: string;
+        notes?: string;
+      };
+      const result = createNodeAllocations({
+        nodeId: Number(req.params.id),
+        ip,
+        ipAlias,
+        portsInput: ports,
+        protocol,
+        notes,
+        userId: req.user!.id,
+        username: req.user!.username,
+        ipAddress: getClientIp(req),
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to create allocations.' });
+    }
+  }
+);
+
+app.patch(
+  '/api/nodes/:id/allocations/:allocId',
+  requireAuth,
+  requireRole('owner', 'admin'),
+  (req: AuthenticatedRequest, res) => {
+    try {
+      const { ipAlias, notes } = req.body as { ipAlias?: string | null; notes?: string | null };
+      const allocation = updateNodeAllocation({
+        nodeId: Number(req.params.id),
+        allocationId: Number(req.params.allocId),
+        ipAlias,
+        notes,
+        userId: req.user!.id,
+        username: req.user!.username,
+        ipAddress: getClientIp(req),
+      });
+      res.json({ allocation });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update allocation.' });
+    }
+  }
+);
+
+app.delete(
+  '/api/nodes/:id/allocations/:allocId',
+  requireAuth,
+  requireRole('owner', 'admin'),
+  (req: AuthenticatedRequest, res) => {
+    try {
+      deleteNodeAllocation({
+        nodeId: Number(req.params.id),
+        allocationId: Number(req.params.allocId),
+        userId: req.user!.id,
+        username: req.user!.username,
+        ipAddress: getClientIp(req),
+      });
+      res.json({ deleted: true });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to delete allocation.' });
+    }
+  }
+);
+
+app.post(
+  '/api/nodes/:id/allocations/bulk-delete',
+  requireAuth,
+  requireRole('owner', 'admin'),
+  (req: AuthenticatedRequest, res) => {
+    try {
+      const { ids } = req.body as { ids: number[] };
+      const result = bulkDeleteNodeAllocations({
+        nodeId: Number(req.params.id),
+        allocationIds: Array.isArray(ids) ? ids : [],
+        userId: req.user!.id,
+        username: req.user!.username,
+        ipAddress: getClientIp(req),
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Bulk delete failed.' });
+    }
+  }
+);
+
 function maskSettingsForResponse(all: Record<string, string>, role: UserRole): Record<string, string> {
+  const aiCfg = resolveOpenAiConfig();
+  const {
+    smtp_pass: _smtp,
+    cloud_secret_key: _csec,
+    cloud_access_key: _cacc,
+    telegram_bot_token: _tg,
+    openai_api_key_enc: _openaiEnc,
+    ...rest
+  } = all;
+
   if (role !== 'owner') {
-    const {
-      smtp_pass: _smtp,
-      cloud_secret_key: _csec,
-      cloud_access_key: _cacc,
-      telegram_bot_token: _tg,
-      ...safe
-    } = all;
-    return safe;
+    return {
+      ...rest,
+      openai_model: aiCfg.model,
+      openai_configured: aiCfg.apiKey ? '1' : '0',
+    };
   }
   return {
-    ...all,
+    ...rest,
     smtp_pass: all.smtp_pass ? '********' : '',
     cloud_secret_key: all.cloud_secret_key ? '********' : '',
+    cloud_access_key: all.cloud_access_key || '',
     telegram_bot_token: all.telegram_bot_token ? '********' : '',
+    openai_api_key: all.openai_api_key_enc ? '********' : '',
+    openai_model: aiCfg.model,
+    openai_configured: aiCfg.apiKey ? '1' : '0',
+    openai_source: aiCfg.source,
   };
 }
 
@@ -1427,6 +1622,26 @@ app.put('/api/settings', requireAuth, requireRole('owner', 'admin'), (req: Authe
     if (typeof body.vps_reboot_warning === 'string') {
       setSetting('vps_reboot_warning', body.vps_reboot_warning.trim().slice(0, 240));
     }
+    if (typeof body.openai_model === 'string') {
+      const m = body.openai_model.trim();
+      if (!ALLOWED_OPENAI_MODEL_REGEX.test(m)) {
+        res.status(400).json({ error: 'Invalid OpenAI model identifier.' });
+        return;
+      }
+      setSetting('openai_model', m);
+    }
+    if (typeof body.openai_api_key === 'string' && body.openai_api_key !== '********') {
+      const rawOpenAiKey = body.openai_api_key.trim();
+      if (!rawOpenAiKey) {
+        setSetting('openai_api_key_enc', '');
+      } else {
+        if (/[\r\n\s]/.test(rawOpenAiKey) || rawOpenAiKey.length < 12 || rawOpenAiKey.length > 256) {
+          res.status(400).json({ error: 'Invalid OpenAI API key format.' });
+          return;
+        }
+        setSetting('openai_api_key_enc', encryptSecret(rawOpenAiKey));
+      }
+    }
   }
 
   recordAuditLog({
@@ -1475,6 +1690,16 @@ app.post('/api/settings/test-cloud', requireAuth, requireRole('owner'), async (_
   }
 });
 
+app.post('/api/settings/test-openai', requireAuth, requireRole('owner'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const { apiKey, model } = (req.body || {}) as { apiKey?: string; model?: string };
+    const result = await testOpenAiConnection({ apiKey, model });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'OpenAI connection test failed.' });
+  }
+});
+
 // ==========================================
 // MINECRAFT SERVER ROUTES
 // ==========================================
@@ -1489,19 +1714,33 @@ app.get('/api/minecraft/servers', requireAuth, async (req: AuthenticatedRequest,
 
 app.post('/api/minecraft/servers', requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
-    const { name, software, version, ramMb, cpuPercent, diskMb, port, eulaAccepted, ownerId, nodeId } =
-      req.body as {
-        name: string;
-        software: string;
-        version: string;
-        ramMb: number;
-        cpuPercent: number;
-        diskMb?: number;
-        port: number;
-        eulaAccepted: boolean;
-        ownerId?: number;
-        nodeId?: number;
-      };
+    const {
+      name,
+      software,
+      version,
+      ramMb,
+      cpuPercent,
+      diskMb,
+      port,
+      primaryAllocationId,
+      additionalAllocationIds,
+      eulaAccepted,
+      ownerId,
+      nodeId,
+    } = req.body as {
+      name: string;
+      software: string;
+      version: string;
+      ramMb: number;
+      cpuPercent: number;
+      diskMb?: number;
+      port?: number;
+      primaryAllocationId?: number | 'auto';
+      additionalAllocationIds?: number[];
+      eulaAccepted: boolean;
+      ownerId?: number;
+      nodeId?: number;
+    };
 
     const isStaff = req.user!.role === 'owner' || req.user!.role === 'admin';
     const targetOwnerId = isStaff && ownerId ? Number(ownerId) : req.user!.id;
@@ -1524,6 +1763,8 @@ app.post('/api/minecraft/servers', requireAuth, async (req: AuthenticatedRequest
       cpuPercent,
       diskMb,
       port,
+      primaryAllocationId,
+      additionalAllocationIds,
       eulaAccepted,
       ownerId: ownerRow.id,
       nodeId,
@@ -1545,11 +1786,12 @@ app.put(
   requireRole('owner', 'admin'),
   (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
-    const { ownerId, ramMb, cpuPercent, diskMb, isSuspended } = req.body as {
+    const { ownerId, ramMb, cpuPercent, diskMb, maxAllocations, isSuspended } = req.body as {
       ownerId?: number;
       ramMb?: number;
       cpuPercent?: number;
       diskMb?: number;
+      maxAllocations?: number;
       isSuspended?: boolean;
     };
 
@@ -1567,6 +1809,7 @@ app.put(
          ram_mb = COALESCE(?, ram_mb),
          cpu_percent = COALESCE(?, cpu_percent),
          disk_mb = COALESCE(?, disk_mb),
+         max_allocations = COALESCE(?, max_allocations),
          is_suspended = COALESCE(?, is_suspended)
        WHERE id = ?`
     ).run(
@@ -1574,6 +1817,7 @@ app.put(
       ramMb ? Math.max(512, Number(ramMb)) : null,
       cpuPercent ? Math.max(25, Number(cpuPercent)) : null,
       diskMb ? Math.max(1024, Number(diskMb)) : null,
+      maxAllocations !== undefined ? Math.max(1, Math.min(50, Number(maxAllocations))) : null,
       isSuspended !== undefined ? (isSuspended ? 1 : 0) : null,
       id
     );
@@ -1583,11 +1827,128 @@ app.put(
       username: req.user!.username,
       action: 'minecraft.admin_update',
       target: srv.container_name,
-      details: `Updated server limits/owner/suspension`,
+      details: `Updated server limits/owner/allocations/suspension`,
       ipAddress: getClientIp(req),
     });
 
     res.json({ updated: true });
+  }
+);
+
+app.get('/api/minecraft/servers/:id/allocations', requireAuth, (req: AuthenticatedRequest, res) => {
+  const id = Number(req.params.id);
+  const access = canAccessMinecraftServer(req.user!, id);
+  if (!access.allowed) {
+    res.status(403).json({ error: access.reason || 'Permission denied.' });
+    return;
+  }
+  const srv = db
+    .prepare('SELECT max_allocations FROM minecraft_servers WHERE id = ?')
+    .get(id) as { max_allocations: number } | undefined;
+  res.json({
+    allocations: listServerAllocations(id),
+    maxAllocations: srv?.max_allocations ?? 3,
+  });
+});
+
+app.post('/api/minecraft/servers/:id/allocations', requireAuth, (req: AuthenticatedRequest, res) => {
+  const id = Number(req.params.id);
+  const access = canAccessMinecraftServer(req.user!, id);
+  if (!access.allowed || !access.isOwnerOrAdmin) {
+    res.status(403).json({ error: access.reason || 'Only the server owner or staff can manage allocations.' });
+    return;
+  }
+  try {
+    const notes = typeof req.body?.notes === 'string' ? req.body.notes : undefined;
+    const isStaff = req.user!.role === 'owner' || req.user!.role === 'admin';
+    const result = assignNextAllocationToServer({
+      serverId: id,
+      notes,
+      isStaff,
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to assign allocation.' });
+  }
+});
+
+app.patch(
+  '/api/minecraft/servers/:id/allocations/:allocId',
+  requireAuth,
+  (req: AuthenticatedRequest, res) => {
+    const id = Number(req.params.id);
+    const access = canAccessMinecraftServer(req.user!, id);
+    if (!access.allowed || !access.isOwnerOrAdmin) {
+      res.status(403).json({ error: access.reason || 'Only the server owner or staff can edit allocation notes.' });
+      return;
+    }
+    try {
+      const notes = typeof req.body?.notes === 'string' ? req.body.notes : null;
+      const allocations = updateServerAllocationNotes({
+        serverId: id,
+        allocationId: Number(req.params.allocId),
+        notes,
+        userId: req.user!.id,
+        username: req.user!.username,
+        ipAddress: getClientIp(req),
+      });
+      res.json({ allocations });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update allocation notes.' });
+    }
+  }
+);
+
+app.post(
+  '/api/minecraft/servers/:id/allocations/:allocId/primary',
+  requireAuth,
+  (req: AuthenticatedRequest, res) => {
+    const id = Number(req.params.id);
+    const access = canAccessMinecraftServer(req.user!, id);
+    if (!access.allowed || !access.isOwnerOrAdmin) {
+      res.status(403).json({ error: access.reason || 'Only the server owner or staff can switch primary port.' });
+      return;
+    }
+    try {
+      const result = setServerPrimaryAllocation({
+        serverId: id,
+        allocationId: Number(req.params.allocId),
+        userId: req.user!.id,
+        username: req.user!.username,
+        ipAddress: getClientIp(req),
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to set primary allocation.' });
+    }
+  }
+);
+
+app.delete(
+  '/api/minecraft/servers/:id/allocations/:allocId',
+  requireAuth,
+  (req: AuthenticatedRequest, res) => {
+    const id = Number(req.params.id);
+    const access = canAccessMinecraftServer(req.user!, id);
+    if (!access.allowed || !access.isOwnerOrAdmin) {
+      res.status(403).json({ error: access.reason || 'Only the server owner or staff can unassign allocations.' });
+      return;
+    }
+    try {
+      const result = unassignServerAllocation({
+        serverId: id,
+        allocationId: Number(req.params.allocId),
+        userId: req.user!.id,
+        username: req.user!.username,
+        ipAddress: getClientIp(req),
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to unassign allocation.' });
+    }
   }
 );
 
@@ -2353,9 +2714,29 @@ app.get('/api/incus/instances', requireAuth, async (req: AuthenticatedRequest, r
   }
 });
 
-app.post('/api/incus/instances', requireAuth, async (req: AuthenticatedRequest, res) => {
+app.get('/api/incus/host-ipv4', requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
-    const { name, type, osTemplate, vcpu, ramMb, diskGb, rootPassword, ownerId, nodeId } = req.body as {
+    const force = req.query.refresh === '1';
+    const ipv4 = await detectHostPublicIpv4(force);
+    res.json({ ipv4 });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to detect host IPv4.' });
+  }
+});
+
+app.get('/api/incus/ports/next-free', requireAuth, (req: AuthenticatedRequest, res) => {
+  try {
+    const protocol = req.query.protocol === 'udp' ? 'udp' : 'tcp';
+    const port = getNextFreeSharedPort(protocol);
+    res.json({ port, protocol });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'No free ports available.' });
+  }
+});
+
+app.post('/api/incus/instances', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const { name, type, osTemplate, vcpu, ramMb, diskGb, rootPassword, ownerId, nodeId, operationId } =
+    req.body as {
       name: string;
       type: 'container' | 'vm';
       osTemplate: string;
@@ -2365,8 +2746,15 @@ app.post('/api/incus/instances', requireAuth, async (req: AuthenticatedRequest, 
       rootPassword: string;
       ownerId?: number;
       nodeId?: number;
+      operationId?: string;
     };
 
+  const opRoom =
+    typeof operationId === 'string' && /^[a-zA-Z0-9_-]{4,64}$/.test(operationId)
+      ? `op:${operationId}`
+      : null;
+
+  try {
     const isStaff = req.user!.role === 'owner' || req.user!.role === 'admin';
     const targetOwnerId = isStaff && ownerId ? Number(ownerId) : req.user!.id;
     const ownerRow = db
@@ -2394,11 +2782,27 @@ app.post('/api/incus/instances', requireAuth, async (req: AuthenticatedRequest, 
       userId: req.user!.id,
       username: req.user!.username,
       ipAddress: getClientIp(req),
+      onProgress: opRoom
+        ? (ev) => {
+            ioRef?.to(opRoom).emit('incus:progress', { operationId, ...ev });
+          }
+        : undefined,
     });
 
     res.status(201).json(result);
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to create instance.' });
+    const message = err instanceof Error ? err.message : 'Failed to create instance.';
+    if (opRoom && operationId) {
+      ioRef?.to(opRoom).emit('incus:progress', {
+        operationId,
+        step: 5,
+        totalSteps: 5,
+        label: 'Provisioning failed',
+        status: 'error',
+        detail: message,
+      });
+    }
+    res.status(400).json({ error: message });
   }
 });
 
@@ -2462,8 +2866,8 @@ app.post('/api/incus/instances/:id/power', requireAuth, async (req: Authenticate
       res.status(403).json({ error: access.reason });
       return;
     }
-    const action = req.body?.action as 'start' | 'stop' | 'restart' | 'delete';
-    if (!['start', 'stop', 'restart', 'delete'].includes(action)) {
+    const action = req.body?.action as 'start' | 'stop' | 'restart' | 'kill' | 'delete';
+    if (!['start', 'stop', 'restart', 'kill', 'delete'].includes(action)) {
       res.status(400).json({ error: 'Invalid instance action.' });
       return;
     }
@@ -2485,7 +2889,7 @@ app.post('/api/incus/instances/:id/power', requireAuth, async (req: Authenticate
   }
 });
 
-app.post('/api/incus/instances/:id/reinstall', requireAuth, async (req: AuthenticatedRequest, res) => {
+app.post('/api/incus/instances/:id/rename', requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
     const id = Number(req.params.id);
     const access = canAccessIncusInstance(req.user!, id);
@@ -2493,10 +2897,39 @@ app.post('/api/incus/instances/:id/reinstall', requireAuth, async (req: Authenti
       res.status(403).json({ error: access.reason });
       return;
     }
-    const { osTemplate, rootPassword } = req.body as {
-      osTemplate: string;
-      rootPassword: string;
-    };
+    const { newName, newHostname } = req.body as { newName?: string; newHostname?: string };
+    const instance = await renameIncusInstance({
+      id,
+      newName: String(newName || ''),
+      newHostname: typeof newHostname === 'string' ? newHostname : undefined,
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+    });
+    res.json({ instance });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Rename failed.' });
+  }
+});
+
+app.post('/api/incus/instances/:id/reinstall', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const { osTemplate, rootPassword, operationId } = req.body as {
+    osTemplate: string;
+    rootPassword: string;
+    operationId?: string;
+  };
+  const opRoom =
+    typeof operationId === 'string' && /^[a-zA-Z0-9_-]{4,64}$/.test(operationId)
+      ? `op:${operationId}`
+      : null;
+
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
     const result = await reinstallIncusInstance({
       id,
       osTemplate,
@@ -2504,10 +2937,26 @@ app.post('/api/incus/instances/:id/reinstall', requireAuth, async (req: Authenti
       userId: req.user!.id,
       username: req.user!.username,
       ipAddress: getClientIp(req),
+      onProgress: opRoom
+        ? (ev) => {
+            ioRef?.to(opRoom).emit('incus:progress', { operationId, ...ev });
+          }
+        : undefined,
     });
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'OS reinstall failed.' });
+    const message = err instanceof Error ? err.message : 'OS reinstall failed.';
+    if (opRoom && operationId) {
+      ioRef?.to(opRoom).emit('incus:progress', {
+        operationId,
+        step: 5,
+        totalSteps: 5,
+        label: 'OS Reinstall failed',
+        status: 'error',
+        detail: message,
+      });
+    }
+    res.status(400).json({ error: message });
   }
 });
 
@@ -2519,10 +2968,361 @@ app.get('/api/incus/instances/:id/metrics', requireAuth, async (req: Authenticat
       res.status(403).json({ error: access.reason });
       return;
     }
-    const metrics = await getIncusInstanceMetrics(id);
+    const metrics = await getIncusInstanceTelemetry(id);
     res.json(metrics);
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to fetch metrics.' });
+  }
+});
+
+// SSH Details, Root Password Reset, Authorized Keys & SSHX
+app.get('/api/incus/instances/:id/ssh', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const details = await getIncusSshDetails(id);
+    res.json(details);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to load SSH details.' });
+  }
+});
+
+app.post('/api/incus/instances/:id/ssh/password', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const newPassword = String(req.body?.password || '');
+    const result = await resetIncusRootPassword({
+      id,
+      newPassword,
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Password reset failed.' });
+  }
+});
+
+app.post('/api/incus/instances/:id/ssh/keys', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const { label, publicKey } = req.body as { label?: string; publicKey?: string };
+    const result = await addVmSshKey({
+      instanceId: id,
+      label: String(label || ''),
+      publicKey: String(publicKey || ''),
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to add SSH key.' });
+  }
+});
+
+app.delete('/api/incus/instances/:id/ssh/keys/:keyId', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const keyId = Number(req.params.keyId);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    await removeVmSshKey({
+      instanceId: id,
+      keyId,
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+    });
+    res.json({ deleted: true });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to delete SSH key.' });
+  }
+});
+
+app.post('/api/incus/instances/:id/sshx', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const session = await launchIncusSshx({
+      instanceId: id,
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+    });
+    res.json(session);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to launch sshx.' });
+  }
+});
+
+app.delete('/api/incus/instances/:id/sshx', requireAuth, (req: AuthenticatedRequest, res) => {
+  const id = Number(req.params.id);
+  const access = canAccessIncusInstance(req.user!, id);
+  if (!access.allowed) {
+    res.status(403).json({ error: access.reason });
+    return;
+  }
+  const stopped = stopIncusSshx(id);
+  res.json({ stopped });
+});
+
+app.post('/api/incus/instances/:id/recipes', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const recipeId = String(req.body?.recipeId || '') as IncusRecipeId;
+    const operationId = typeof req.body?.operationId === 'string' ? req.body.operationId : '';
+    const opRoom = /^[a-zA-Z0-9_-]{4,64}$/.test(operationId) ? `op:${operationId}` : null;
+
+    const result = await runIncusAppRecipe({
+      instanceId: id,
+      recipeId,
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+      onOutput: opRoom
+        ? (chunk) => {
+            ioRef?.to(opRoom).emit('incus:recipe:output', { operationId, chunk });
+          }
+        : undefined,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Recipe installation failed.' });
+  }
+});
+
+// VPS File Manager Routes (incus file push/pull + exec)
+app.get('/api/incus/instances/:id/files', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const dir = typeof req.query.path === 'string' ? req.query.path : '/root';
+    const data = await listContainerFiles(id, dir);
+    res.json(data);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to list VPS files.' });
+  }
+});
+
+app.get('/api/incus/instances/:id/files/content', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const filePath = typeof req.query.path === 'string' ? req.query.path : '';
+    const data = await readContainerFile(id, filePath);
+    res.json(data);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to read file.' });
+  }
+});
+
+app.put('/api/incus/instances/:id/files/content', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const { path: filePath, content } = req.body as { path?: string; content?: string };
+    if (typeof filePath !== 'string' || typeof content !== 'string') {
+      res.status(400).json({ error: 'File path and content are required.' });
+      return;
+    }
+    await writeContainerFile({
+      instanceId: id,
+      filePath,
+      content,
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+    });
+    res.json({ saved: true });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to save file.' });
+  }
+});
+
+app.post('/api/incus/instances/:id/files/entry', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const { path: targetPath, type } = req.body as { path?: string; type?: 'file' | 'folder' };
+    if (typeof targetPath !== 'string' || (type !== 'file' && type !== 'folder')) {
+      res.status(400).json({ error: 'Valid path and entry type are required.' });
+      return;
+    }
+    const createdPath = await createContainerEntry({
+      instanceId: id,
+      targetPath,
+      type,
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+    });
+    res.status(201).json({ created: true, path: createdPath });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to create entry.' });
+  }
+});
+
+app.post('/api/incus/instances/:id/files/move', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const { sourcePath, destPath } = req.body as { sourcePath?: string; destPath?: string };
+    await renameOrMoveContainerEntry({
+      instanceId: id,
+      sourcePath: String(sourcePath || ''),
+      destPath: String(destPath || ''),
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+    });
+    res.json({ moved: true });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Rename/move failed.' });
+  }
+});
+
+app.post('/api/incus/instances/:id/files/chmod', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const { path: targetPath, mode } = req.body as { path?: string; mode?: string };
+    await chmodContainerEntry({
+      instanceId: id,
+      targetPath: String(targetPath || ''),
+      mode: String(mode || ''),
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+    });
+    res.json({ updated: true });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to change permissions.' });
+  }
+});
+
+app.delete('/api/incus/instances/:id/files/entry', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const targetPath = typeof req.query.path === 'string' ? req.query.path : '';
+    await deleteContainerEntry({
+      instanceId: id,
+      targetPath,
+      userId: req.user!.id,
+      username: req.user!.username,
+      ipAddress: getClientIp(req),
+    });
+    res.json({ deleted: true });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Delete failed.' });
+  }
+});
+
+app.post(
+  '/api/incus/instances/:id/files/upload',
+  requireAuth,
+  upload.array('files', 10),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const id = Number(req.params.id);
+      const access = canAccessIncusInstance(req.user!, id);
+      if (!access.allowed) {
+        res.status(403).json({ error: access.reason });
+        return;
+      }
+      const targetDir = typeof req.body?.dir === 'string' ? req.body.dir : '/root';
+      const files = (req.files as Express.Multer.File[]) || [];
+      const uploaded = await uploadContainerFiles({
+        instanceId: id,
+        targetDir,
+        files,
+        userId: req.user!.id,
+        username: req.user!.username,
+        ipAddress: getClientIp(req),
+      });
+      res.json({ uploaded });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Upload failed.' });
+    }
+  }
+);
+
+app.get('/api/incus/instances/:id/files/download', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    const access = canAccessIncusInstance(req.user!, id);
+    if (!access.allowed) {
+      res.status(403).json({ error: access.reason });
+      return;
+    }
+    const targetPath = typeof req.query.path === 'string' ? req.query.path : '';
+    const format = req.query.format === 'zip' ? 'zip' : 'tar.gz';
+    const { filePath, filename, cleanupDir } = await prepareContainerDownload({
+      instanceId: id,
+      targetPath,
+      archiveFormat: format,
+    });
+    res.download(filePath, filename, () => {
+      fs.rmSync(cleanupDir, { recursive: true, force: true });
+    });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Download failed.' });
   }
 });
 
@@ -3100,6 +3900,158 @@ app.delete(
 );
 
 // ==========================================
+// AI AGENT ROUTES (MINECRAFT & VPS SYSADMIN)
+// ==========================================
+app.get('/api/ai/status', requireAuth, (_req, res) => {
+  const cfg = resolveOpenAiConfig();
+  res.json({
+    configured: Boolean(cfg.apiKey),
+    model: cfg.model,
+    source: cfg.source,
+  });
+});
+
+app.get('/api/ai/:agentType/:resourceId/history', requireAuth, (req: AuthenticatedRequest, res) => {
+  const agentType = req.params.agentType as AiAgentType;
+  const resourceId = Number(req.params.resourceId);
+  if (agentType !== 'minecraft' && agentType !== 'vps') {
+    res.status(400).json({ error: 'Invalid AI agent type.' });
+    return;
+  }
+  if (!Number.isInteger(resourceId) || resourceId <= 0) {
+    res.status(400).json({ error: 'Invalid resource ID.' });
+    return;
+  }
+
+  const access =
+    agentType === 'minecraft'
+      ? canAccessMinecraftServer(req.user!, resourceId)
+      : canAccessIncusInstance(req.user!, resourceId);
+  if (!access.allowed) {
+    res.status(403).json({ error: access.reason });
+    return;
+  }
+
+  const messages = listAiChatHistory({
+    agentType,
+    resourceId,
+    userId: req.user!.id,
+  });
+  const cfg = resolveOpenAiConfig();
+  res.json({
+    messages,
+    configured: Boolean(cfg.apiKey),
+    model: cfg.model,
+  });
+});
+
+app.delete('/api/ai/:agentType/:resourceId/history', requireAuth, (req: AuthenticatedRequest, res) => {
+  const agentType = req.params.agentType as AiAgentType;
+  const resourceId = Number(req.params.resourceId);
+  if (agentType !== 'minecraft' && agentType !== 'vps') {
+    res.status(400).json({ error: 'Invalid AI agent type.' });
+    return;
+  }
+  if (!Number.isInteger(resourceId) || resourceId <= 0) {
+    res.status(400).json({ error: 'Invalid resource ID.' });
+    return;
+  }
+
+  const access =
+    agentType === 'minecraft'
+      ? canAccessMinecraftServer(req.user!, resourceId)
+      : canAccessIncusInstance(req.user!, resourceId);
+  if (!access.allowed) {
+    res.status(403).json({ error: access.reason });
+    return;
+  }
+
+  clearAiChatHistory({
+    agentType,
+    resourceId,
+    userId: req.user!.id,
+  });
+  res.json({ cleared: true });
+});
+
+app.post('/api/ai/:agentType/:resourceId/chat', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const agentType = req.params.agentType as AiAgentType;
+    const resourceId = Number(req.params.resourceId);
+    if (agentType !== 'minecraft' && agentType !== 'vps') {
+      res.status(400).json({ error: 'Invalid AI agent type.' });
+      return;
+    }
+    if (!Number.isInteger(resourceId) || resourceId <= 0) {
+      res.status(400).json({ error: 'Invalid resource ID.' });
+      return;
+    }
+
+    const { message, confirmationMode = 'ask', analyzeLogs = false } = (req.body || {}) as {
+      message?: string;
+      confirmationMode?: AiConfirmationMode;
+      analyzeLogs?: boolean;
+    };
+    const mode: AiConfirmationMode = confirmationMode === 'auto' ? 'auto' : 'ask';
+
+    const result = await runAgentChat({
+      agentType,
+      resourceId,
+      user: req.user!,
+      message: String(message || ''),
+      confirmationMode: mode,
+      analyzeLogs: Boolean(analyzeLogs),
+      ipAddress: getClientIp(req),
+    });
+
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'AI agent request failed.' });
+  }
+});
+
+app.post(
+  '/api/ai/:agentType/:resourceId/actions/:messageId/:actionId',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const agentType = req.params.agentType as AiAgentType;
+      const resourceId = Number(req.params.resourceId);
+      const messageId = Number(req.params.messageId);
+      const actionId = String(req.params.actionId || '');
+      if (agentType !== 'minecraft' && agentType !== 'vps') {
+        res.status(400).json({ error: 'Invalid AI agent type.' });
+        return;
+      }
+      if (!Number.isInteger(resourceId) || !Number.isInteger(messageId) || !actionId) {
+        res.status(400).json({ error: 'Invalid action reference.' });
+        return;
+      }
+
+      const { decision } = (req.body || {}) as { decision?: string };
+      if (decision !== 'approve' && decision !== 'reject') {
+        res.status(400).json({ error: 'decision must be approve or reject.' });
+        return;
+      }
+
+      const updatedMessage = await resolvePendingAiAction({
+        agentType,
+        resourceId,
+        messageId,
+        actionId,
+        decision,
+        user: req.user!,
+        ipAddress: getClientIp(req),
+      });
+
+      res.json({ message: updatedMessage });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Action resolution failed.' });
+    }
+  }
+);
+
+// ==========================================
 // HTTP SERVER, SOCKET.IO & VITE / STATIC SETUP
 // ==========================================
 async function startServer() {
@@ -3111,6 +4063,7 @@ async function startServer() {
     path: '/socket.io',
     cors: { origin: false },
   });
+  ioRef = io;
 
   io.use((socket, next) => {
     const token = typeof socket.handshake.auth?.token === 'string' ? socket.handshake.auth.token : '';
@@ -3169,6 +4122,8 @@ async function startServer() {
 
     let logStream: NodeJS.ReadableStream | null = null;
     let shellProc: ReturnType<typeof spawn> | null = null;
+    let shellPty: { write: (data: string) => void; resize: (cols: number, rows: number) => void; kill: () => void } | null = null;
+    let metricsTimer: ReturnType<typeof setInterval> | null = null;
 
     const cleanupLogStream = () => {
       if (logStream) {
@@ -3182,6 +4137,14 @@ async function startServer() {
     };
 
     const cleanupShellProc = () => {
+      if (shellPty) {
+        try {
+          shellPty.kill();
+        } catch {
+          // ignore
+        }
+        shellPty = null;
+      }
       if (shellProc) {
         try {
           shellProc.kill('SIGTERM');
@@ -3191,6 +4154,45 @@ async function startServer() {
         shellProc = null;
       }
     };
+
+    const cleanupMetricsTimer = () => {
+      if (metricsTimer) {
+        clearInterval(metricsTimer);
+        metricsTimer = null;
+      }
+    };
+
+    socket.on('incus:op:subscribe', (payload: { operationId?: string }) => {
+      const opId = typeof payload?.operationId === 'string' ? payload.operationId.trim() : '';
+      if (/^[a-zA-Z0-9_-]{4,64}$/.test(opId)) {
+        void socket.join(`op:${opId}`);
+      }
+    });
+
+    socket.on('incus:metrics:subscribe', async (payload: { instanceId?: number }) => {
+      cleanupMetricsTimer();
+      const instanceId = Number(payload?.instanceId);
+      const access = canAccessIncusInstance(socket.data.user, instanceId);
+      if (!access.allowed) return;
+
+      const pushTelemetry = async () => {
+        try {
+          const telemetry = await getIncusInstanceTelemetry(instanceId);
+          socket.emit('incus:metrics:data', telemetry);
+        } catch {
+          // ignore transient poll errors
+        }
+      };
+
+      void pushTelemetry();
+      metricsTimer = setInterval(() => {
+        void pushTelemetry();
+      }, 1500);
+    });
+
+    socket.on('incus:metrics:unsubscribe', () => {
+      cleanupMetricsTimer();
+    });
 
     socket.on('mc:attach', async (payload: { serverId?: number }) => {
       cleanupLogStream();
@@ -3268,71 +4270,129 @@ async function startServer() {
       }
     });
 
-    socket.on('incus:shell:start', async (payload: { instanceId?: number }) => {
-      cleanupShellProc();
-      const instanceId = Number(payload?.instanceId);
-      const access = canAccessIncusInstance(socket.data.user, instanceId);
-      if (!access.allowed) {
-        socket.emit('incus:shell:data', `\x1b[31m[Access Denied] ${access.reason}\x1b[0m\r\n`);
-        return;
+    socket.on(
+      'incus:shell:start',
+      async (payload: { instanceId?: number; cols?: number; rows?: number; rescue?: boolean }) => {
+        cleanupShellProc();
+        const instanceId = Number(payload?.instanceId);
+        const access = canAccessIncusInstance(socket.data.user, instanceId);
+        if (!access.allowed) {
+          socket.emit('incus:shell:data', `\x1b[31m[Access Denied] ${access.reason}\x1b[0m\r\n`);
+          return;
+        }
+
+        const inst = db.prepare('SELECT * FROM vm_instances WHERE id = ?').get(instanceId) as
+          | VmInstanceRow
+          | undefined;
+        if (!inst) {
+          socket.emit('incus:shell:data', '\x1b[31m[Error] Instance not found.\x1b[0m\r\n');
+          return;
+        }
+
+        const incusUp = await isIncusReady();
+        if (!incusUp) {
+          socket.emit(
+            'incus:shell:data',
+            `\x1b[35m[FB BAHI Web Console]\x1b[0m Instance: \x1b[36m${inst.instance_name}\x1b[0m (${inst.os_template})\r\n` +
+              `\x1b[33m[Notice]\x1b[0m Incus CLI/daemon is not available on this host.\r\n` +
+              `Run \x1b[36msudo bash install.sh\x1b[0m on Ubuntu/Debian VPS to attach a live node-pty root shell.\r\n`
+          );
+          return;
+        }
+
+        const cols = Math.min(240, Math.max(20, Number(payload?.cols) || 100));
+        const rows = Math.min(80, Math.max(10, Number(payload?.rows) || 28));
+        const isRescue = Boolean(payload?.rescue);
+
+        const execScript = isRescue
+          ? 'export TERM=xterm-256color; echo "[RESCUE SHELL] Root emergency shell active on $(hostname)"; exec /bin/sh -i'
+          : 'export TERM=xterm-256color; command -v bash >/dev/null && exec bash -i || exec sh -i';
+
+        const args = ['exec', inst.instance_name, '--', '/bin/sh', '-c', execScript];
+
+        try {
+          const ptyMod = await import('node-pty');
+          const ptySpawn = ptyMod.spawn || ptyMod.default?.spawn;
+          if (typeof ptySpawn === 'function') {
+            const term = ptySpawn('incus', args, {
+              name: 'xterm-256color',
+              cols,
+              rows,
+              env: { ...process.env, TERM: 'xterm-256color' },
+            });
+            shellPty = term;
+            term.onData((chunk) => {
+              socket.emit('incus:shell:data', chunk);
+            });
+            term.onExit(({ exitCode }) => {
+              socket.emit(
+                'incus:shell:data',
+                `\r\n\x1b[33m[PTY Shell exited with code ${exitCode}]\x1b[0m\r\n`
+              );
+            });
+            return;
+          }
+        } catch {
+          // Fallback cleanly to standard child_process spawn if native pty fails
+        }
+
+        const proc = spawn('incus', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+        shellProc = proc;
+        proc.stdout?.on('data', (chunk: Buffer) => {
+          socket.emit('incus:shell:data', chunk.toString('utf8').replace(/\n/g, '\r\n'));
+        });
+        proc.stderr?.on('data', (chunk: Buffer) => {
+          socket.emit('incus:shell:data', chunk.toString('utf8').replace(/\n/g, '\r\n'));
+        });
+        proc.on('close', (code) => {
+          socket.emit(
+            'incus:shell:data',
+            `\r\n\x1b[33m[Shell exited with code ${code ?? 0}]\x1b[0m\r\n`
+          );
+        });
       }
+    );
 
-      const inst = db.prepare('SELECT * FROM vm_instances WHERE id = ?').get(instanceId) as
-        | VmInstanceRow
-        | undefined;
-      if (!inst) {
-        socket.emit('incus:shell:data', '\x1b[31m[Error] Instance not found.\x1b[0m\r\n');
-        return;
+    socket.on('incus:shell:resize', (payload: { cols?: number; rows?: number }) => {
+      if (!shellPty) return;
+      const cols = Math.min(240, Math.max(20, Number(payload?.cols) || 100));
+      const rows = Math.min(80, Math.max(10, Number(payload?.rows) || 28));
+      try {
+        shellPty.resize(cols, rows);
+      } catch {
+        // ignore invalid resize
       }
-
-      const incusUp = await isIncusReady();
-      if (!incusUp) {
-        socket.emit(
-          'incus:shell:data',
-          `\x1b[35m[FB BAHI Web Shell]\x1b[0m Instance: \x1b[36m${inst.instance_name}\x1b[0m (${inst.os_template})\r\n` +
-            `\x1b[33m[Notice]\x1b[0m Incus CLI/daemon is not available on this host.\r\n` +
-            `Run \x1b[36msudo bash install.sh\x1b[0m on Ubuntu/Debian VPS to attach a live interactive Incus root shell.\r\n`
-        );
-        return;
-      }
-
-      const proc = spawn(
-        'incus',
-        [
-          'exec',
-          inst.instance_name,
-          '--',
-          '/bin/sh',
-          '-c',
-          'command -v bash >/dev/null && exec bash -i || exec sh -i',
-        ],
-        { stdio: ['pipe', 'pipe', 'pipe'] }
-      );
-      shellProc = proc;
-
-      proc.stdout?.on('data', (chunk: Buffer) => {
-        socket.emit('incus:shell:data', chunk.toString('utf8').replace(/\n/g, '\r\n'));
-      });
-      proc.stderr?.on('data', (chunk: Buffer) => {
-        socket.emit('incus:shell:data', chunk.toString('utf8').replace(/\n/g, '\r\n'));
-      });
-      proc.on('close', (code) => {
-        socket.emit(
-          'incus:shell:data',
-          `\r\n\x1b[33m[Shell exited with code ${code ?? 0}]\x1b[0m\r\n`
-        );
-      });
     });
 
     socket.on('incus:shell:input', (data: string) => {
-      if (shellProc && shellProc.stdin && !shellProc.stdin.destroyed && typeof data === 'string') {
+      if (typeof data !== 'string') return;
+      if (shellPty) {
+        shellPty.write(data);
+      } else if (shellProc && shellProc.stdin && !shellProc.stdin.destroyed) {
         shellProc.stdin.write(data);
+      }
+    });
+
+    socket.on('incus:shell:macro', (payload: { macro?: string }) => {
+      const macros: Record<string, string> = {
+        update:
+          'if command -v apt-get >/dev/null; then apt-get update && apt-get upgrade -y; elif command -v dnf >/dev/null; then dnf upgrade -y; elif command -v apk >/dev/null; then apk update && apk upgrade; fi\r',
+        docker: 'curl -fsSL https://get.docker.com | sh\r',
+        htop: 'command -v htop >/dev/null && htop || top\r',
+      };
+      const cmd = macros[String(payload?.macro || '')];
+      if (!cmd) return;
+      if (shellPty) {
+        shellPty.write(cmd);
+      } else if (shellProc && shellProc.stdin && !shellProc.stdin.destroyed) {
+        shellProc.stdin.write(cmd);
       }
     });
 
     socket.on('disconnect', () => {
       cleanupLogStream();
       cleanupShellProc();
+      cleanupMetricsTimer();
     });
   });
 
