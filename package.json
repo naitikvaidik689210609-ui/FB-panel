@@ -1,7 +1,7 @@
 {
-  "name": "react-example",
+  "name": "fb-bahi-panel",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -47,7 +47,6 @@
     "motion": "^12.23.24",
     "multer": "^2.5.0",
     "node-cron": "^4.6.0",
-    "node-pty": "^1.1.0",
     "openai": "^7.62.0",
     "otplib": "^13.6.0",
     "qrcode": "^1.5.4",
@@ -58,6 +57,9 @@
     "socket.io-client": "^4.8.4",
     "tar": "^7.5.23",
     "vite": "^8.3.0"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

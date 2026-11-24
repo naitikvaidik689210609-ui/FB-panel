@@ -207,6 +207,15 @@ function getDaemonErrorStatus(err: unknown, fallback = 400): number {
   return fallback;
 }
 
+function parseBoundedInt(value: unknown, min: number, max?: number): number | null {
+  if (value === undefined || value === null || value === '') return null;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  let bounded = Math.max(min, Math.round(num));
+  if (max !== undefined) bounded = Math.min(max, bounded);
+  return bounded;
+}
+
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '5mb' }));
@@ -764,11 +773,11 @@ app.post('/api/users/:id/approve', requireAuth, requireRole('owner', 'admin'), (
        max_vm_instances = COALESCE(?, max_vm_instances)
      WHERE id = ?`
   ).run(
-    body.max_ram_mb !== undefined ? Math.max(512, Number(body.max_ram_mb)) : null,
-    body.max_cpu_percent !== undefined ? Math.max(100, Number(body.max_cpu_percent)) : null,
-    body.max_disk_gb !== undefined ? Math.max(5, Number(body.max_disk_gb)) : null,
-    body.max_mc_servers !== undefined ? Math.max(0, Number(body.max_mc_servers)) : null,
-    body.max_vm_instances !== undefined ? Math.max(0, Number(body.max_vm_instances)) : null,
+    parseBoundedInt(body.max_ram_mb, 512),
+    parseBoundedInt(body.max_cpu_percent, 100),
+    parseBoundedInt(body.max_disk_gb, 5),
+    parseBoundedInt(body.max_mc_servers, 0),
+    parseBoundedInt(body.max_vm_instances, 0),
     target.id
   );
 
@@ -981,11 +990,11 @@ app.put('/api/users/:id', requireAuth, requireRole('owner', 'admin'), (req: Auth
      WHERE id = ?`
   ).run(
     nextRole,
-    max_ram_mb !== undefined ? Math.max(512, Number(max_ram_mb)) : null,
-    max_cpu_percent !== undefined ? Math.max(100, Number(max_cpu_percent)) : null,
-    max_disk_gb !== undefined ? Math.max(5, Number(max_disk_gb)) : null,
-    max_mc_servers !== undefined ? Math.max(0, Number(max_mc_servers)) : null,
-    max_vm_instances !== undefined ? Math.max(0, Number(max_vm_instances)) : null,
+    parseBoundedInt(max_ram_mb, 512),
+    parseBoundedInt(max_cpu_percent, 100),
+    parseBoundedInt(max_disk_gb, 5),
+    parseBoundedInt(max_mc_servers, 0),
+    parseBoundedInt(max_vm_instances, 0),
     target.id
   );
 
@@ -2036,11 +2045,11 @@ app.put(
          is_suspended = COALESCE(?, is_suspended)
        WHERE id = ?`
     ).run(
-      ownerId ? Number(ownerId) : null,
-      ramMb ? Math.max(512, Number(ramMb)) : null,
-      cpuPercent ? Math.max(25, Number(cpuPercent)) : null,
-      diskMb ? Math.max(1024, Number(diskMb)) : null,
-      maxAllocations !== undefined ? Math.max(1, Math.min(50, Number(maxAllocations))) : null,
+      parseBoundedInt(ownerId, 1),
+      parseBoundedInt(ramMb, 512),
+      parseBoundedInt(cpuPercent, 25),
+      parseBoundedInt(diskMb, 1024),
+      parseBoundedInt(maxAllocations, 1, 50),
       isSuspended !== undefined ? (isSuspended ? 1 : 0) : null,
       id
     );
@@ -3060,10 +3069,10 @@ app.put(
          is_suspended = COALESCE(?, is_suspended)
        WHERE id = ?`
     ).run(
-      ownerId ? Number(ownerId) : null,
-      vcpu ? Math.max(1, Number(vcpu)) : null,
-      ramMb ? Math.max(256, Number(ramMb)) : null,
-      diskGb ? Math.max(5, Number(diskGb)) : null,
+      parseBoundedInt(ownerId, 1),
+      parseBoundedInt(vcpu, 1),
+      parseBoundedInt(ramMb, 256),
+      parseBoundedInt(diskGb, 5),
       isSuspended !== undefined ? (isSuspended ? 1 : 0) : null,
       id
     );

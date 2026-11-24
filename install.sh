@@ -2,15 +2,21 @@
 set -euo pipefail
 
 # ==============================================================================
-# FB BAHI Panel — Ubuntu (22.04/24.04) & Debian VPS Installer & Lifecycle CLI
+# FB BAHI Panel — Ubuntu (22.04/24.04) & Debian VPS Remote Installer & Manager
+# Supports: bash <(curl -fsSL https://raw.githubusercontent.com/naitikvaidik689210609-ui/FB-panel/main/install.sh)
 # ==============================================================================
 
+REPO_URL="https://github.com/naitikvaidik689210609-ui/FB-panel.git"
+BRANCH="main"
+TARBALL_URL="https://codeload.github.com/naitikvaidik689210609-ui/FB-panel/tar.gz/refs/heads/${BRANCH}"
+
 INSTALL_DIR="/opt/fbbahi-panel"
+TMP_SRC_DIR="/tmp/fb-panel-src"
+TMP_TARBALL="/tmp/fb-panel-src.tar.gz"
 SERVICE_NAME="fbbahi-panel.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 BACKUP_DIR="/var/backups/fbbahi-panel"
 PANEL_PORT="6767"
-REPO_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PURPLE="\033[1;35m"
 CYAN="\033[1;36m"
@@ -20,9 +26,14 @@ RED="\033[1;31m"
 RESET="\033[0m"
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo -e "${RED}[Error] This installer must be run as root. Try: sudo bash install.sh${RESET}"
+  echo -e "${RED}[Error] This installer must be run as root. Try: sudo bash <(curl -fsSL https://raw.githubusercontent.com/naitikvaidik689210609-ui/FB-panel/main/install.sh)${RESET}"
   exit 1
 fi
+
+cleanup_staging() {
+  rm -rf "${TMP_SRC_DIR}" "${TMP_TARBALL}" 2>/dev/null || true
+}
+trap cleanup_staging EXIT INT TERM
 
 print_banner() {
   clear || true
@@ -39,18 +50,40 @@ EOF
   echo -e "${PURPLE}  =================================================${RESET}\n"
 }
 
-install_system_packages() {
-  echo -e "${CYAN}[1/5] Updating apt packages and installing prerequisites...${RESET}"
-  apt-get update -y
-  apt-get install -y curl wget git ca-certificates gnupg lsb-release sqlite3 build-essential python3 make g++ rsync
+ensure_fetch_tools() {
+  local need_apt=0
+  local cmd
+  for cmd in git curl tar rsync openssl; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+      need_apt=1
+      break
+    fi
+  done
 
+  if [[ "${need_apt}" -eq 1 ]]; then
+    echo -e "${CYAN}[Prep] Installing required fetch tools (git, curl, tar, rsync, openssl)...${RESET}"
+    apt-get update -y
+    apt-get install -y curl wget git ca-certificates gnupg lsb-release tar rsync openssl
+  fi
+}
+
+ensure_node_runtime() {
   if ! command -v node >/dev/null 2>&1 || [[ "$(node -v | sed 's/v//' | cut -d. -f1)" -lt 18 ]]; then
-    echo -e "${CYAN}[2/5] Installing Node.js 20.x LTS...${RESET}"
+    echo -e "${CYAN}[Runtime] Installing Node.js 20.x LTS...${RESET}"
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
     apt-get install -y nodejs
   else
     echo -e "${GREEN}[OK] Node.js $(node -v) already installed.${RESET}"
   fi
+}
+
+install_system_packages() {
+  echo -e "${CYAN}[1/5] Updating apt packages and installing prerequisites...${RESET}"
+  apt-get update -y
+  apt-get install -y curl wget git ca-certificates gnupg lsb-release sqlite3 build-essential python3 make g++ rsync tar openssl
+
+  echo -e "${CYAN}[2/5] Checking Node.js runtime...${RESET}"
+  ensure_node_runtime
 
   if ! command -v docker >/dev/null 2>&1; then
     echo -e "${CYAN}[3/5] Installing Docker Engine...${RESET}"
@@ -78,13 +111,94 @@ install_system_packages() {
     incus admin init --auto || true
   else
     echo -e "${GREEN}[OK] Incus already installed.${RESET}"
+    systemctl enable --now incus || true
   fi
 }
 
+fetch_github_source() {
+  ensure_fetch_tools
+  echo -e "${CYAN}[Fetch] Downloading FB BAHI Panel (${BRANCH}) from GitHub...${RESET}"
+
+  local fetched=0
+  if [[ -d "${TMP_SRC_DIR}/.git" ]]; then
+    if git -C "${TMP_SRC_DIR}" remote get-url origin 2>/dev/null | grep -qF "${REPO_URL}"; then
+      if git -C "${TMP_SRC_DIR}" fetch --depth 1 origin "${BRANCH}" && \
+         git -C "${TMP_SRC_DIR}" checkout -f "${BRANCH}" && \
+         git -C "${TMP_SRC_DIR}" reset --hard "origin/${BRANCH}"; then
+        fetched=1
+      fi
+    fi
+  fi
+
+  if [[ "${fetched}" -eq 0 ]]; then
+    rm -rf "${TMP_SRC_DIR}"
+    if git clone --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${TMP_SRC_DIR}"; then
+      fetched=1
+    else
+      echo -e "${YELLOW}[Fetch] git clone failed; trying GitHub tarball fallback...${RESET}"
+      rm -rf "${TMP_SRC_DIR}" "${TMP_TARBALL}"
+      mkdir -p "${TMP_SRC_DIR}"
+      if curl -fsSL "${TARBALL_URL}" -o "${TMP_TARBALL}" && \
+         tar -xzf "${TMP_TARBALL}" --strip-components=1 -C "${TMP_SRC_DIR}"; then
+        fetched=1
+      fi
+      rm -f "${TMP_TARBALL}"
+    fi
+  fi
+
+  if [[ "${fetched}" -ne 1 ]]; then
+    echo -e "${RED}[Error] Failed to download FB BAHI Panel source from ${REPO_URL} (${BRANCH}).${RESET}"
+    cleanup_staging
+    return 1
+  fi
+
+  if [[ ! -f "${TMP_SRC_DIR}/package.json" ]]; then
+    echo -e "${RED}[Error] Downloaded source is missing package.json (${TMP_SRC_DIR}/package.json).${RESET}"
+    cleanup_staging
+    return 1
+  fi
+
+  if [[ ! -f "${TMP_SRC_DIR}/server.js" ]]; then
+    if [[ -f "${TMP_SRC_DIR}/server.ts" ]]; then
+      echo -e "${YELLOW}[Notice] server.js not prebuilt in repository; will compile from server.ts during deployment.${RESET}"
+    else
+      echo -e "${RED}[Error] Downloaded source is missing server.js (${TMP_SRC_DIR}/server.js).${RESET}"
+      cleanup_staging
+      return 1
+    fi
+  fi
+
+  echo -e "${GREEN}[OK] Verified source repository in ${TMP_SRC_DIR}.${RESET}"
+}
+
 deploy_application_files() {
+  fetch_github_source
+  ensure_node_runtime
+
   echo -e "${CYAN}[5/5] Deploying panel files to ${INSTALL_DIR}...${RESET}"
-  mkdir -p "${INSTALL_DIR}" "${INSTALL_DIR}/data/servers/mc" "${INSTALL_DIR}/data/servers/vm-backups" "${INSTALL_DIR}/uploads/backgrounds" "${INSTALL_DIR}/backups"
-  rsync -a --exclude 'node_modules' --exclude 'data' --exclude 'uploads' --exclude 'backups' --exclude 'dist' --exclude 'server.js' --exclude '*.db*' --exclude '.env' --exclude '.git' "${REPO_SOURCE_DIR}/" "${INSTALL_DIR}/"
+  mkdir -p \
+    "${INSTALL_DIR}" \
+    "${INSTALL_DIR}/data/servers/mc" \
+    "${INSTALL_DIR}/data/servers/vm-backups" \
+    "${INSTALL_DIR}/uploads/backgrounds" \
+    "${INSTALL_DIR}/backups"
+
+  rsync -a --delete \
+    --exclude 'node_modules' \
+    --exclude 'data' \
+    --exclude 'uploads' \
+    --exclude 'backups' \
+    --exclude 'database.sqlite*' \
+    --exclude '*.db*' \
+    --exclude '.env' \
+    --exclude '.git' \
+    "${TMP_SRC_DIR}/" "${INSTALL_DIR}/"
+
+  if [[ ! -f "${INSTALL_DIR}/package.json" ]]; then
+    echo -e "${RED}[Error] ${INSTALL_DIR}/package.json is missing after sync. Aborting.${RESET}"
+    cleanup_staging
+    return 1
+  fi
 
   if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
     local jwt_secret
@@ -106,10 +220,23 @@ EOF
     fi
   fi
 
-  pushd "${INSTALL_DIR}" >/dev/null
-  npm install
-  npm run build
-  popd >/dev/null
+  cd "${INSTALL_DIR}"
+  if [[ -f "${INSTALL_DIR}/server.js" && -f "${INSTALL_DIR}/dist/index.html" ]]; then
+    echo -e "${CYAN}[NPM] Installing production dependencies (--omit=dev)...${RESET}"
+    npm install --omit=dev --no-audit --no-fund
+  else
+    echo -e "${CYAN}[Build] Prebuilt dist/server.js not found; installing build dependencies and compiling...${RESET}"
+    npm install --no-audit --no-fund
+    npm run build
+  fi
+
+  if [[ ! -f "${INSTALL_DIR}/server.js" ]]; then
+    echo -e "${RED}[Error] ${INSTALL_DIR}/server.js missing after deployment.${RESET}"
+    cleanup_staging
+    return 1
+  fi
+
+  cleanup_staging
 }
 
 configure_firewall_port() {
@@ -183,7 +310,7 @@ EOF
 
 create_admin_interactive() {
   if [[ ! -f "${INSTALL_DIR}/create-admin.js" ]]; then
-    echo -e "${RED}[Error] Panel is not installed in ${INSTALL_DIR}.${RESET}"
+    echo -e "${RED}[Error] Panel is not installed in ${INSTALL_DIR} (missing create-admin.js).${RESET}"
     return 1
   fi
 
@@ -198,9 +325,14 @@ create_admin_interactive() {
     return 1
   fi
 
-  pushd "${INSTALL_DIR}" >/dev/null
-  DB_PATH="${INSTALL_DIR}/data/panel.db" node "${INSTALL_DIR}/create-admin.js" "${admin_user}" "${admin_email}" "${admin_pass}"
-  popd >/dev/null
+  cd "${INSTALL_DIR}"
+  if [[ -f "${INSTALL_DIR}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${INSTALL_DIR}/.env"
+    set +a
+  fi
+  DB_PATH="${DB_PATH:-${INSTALL_DIR}/data/panel.db}" node "${INSTALL_DIR}/create-admin.js" "${admin_user}" "${admin_email}" "${admin_pass}"
   echo -e "${GREEN}[OK] Admin user saved.${RESET}"
 }
 
@@ -218,17 +350,25 @@ action_reinstall() {
   echo -e "${YELLOW}[Reinstall] Stopping ${SERVICE_NAME}...${RESET}"
   systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
 
-  if [[ -f "${INSTALL_DIR}/data/panel.db" ]]; then
+  if [[ -f "${INSTALL_DIR}/data/panel.db" || -f "${INSTALL_DIR}/database.sqlite" ]]; then
     read -rp "Back up existing SQLite database before reinstalling? [Y/n]: " do_backup
     if [[ ! "${do_backup}" =~ ^[Nn]$ ]]; then
       mkdir -p "${BACKUP_DIR}"
       local stamp
       stamp="$(date +%Y%m%d-%H%M%S)"
-      cp -a "${INSTALL_DIR}/data/panel.db" "${BACKUP_DIR}/panel-${stamp}.db"
-      echo -e "${GREEN}[OK] Database backed up to ${BACKUP_DIR}/panel-${stamp}.db${RESET}"
+      if [[ -f "${INSTALL_DIR}/data/panel.db" ]]; then
+        cp -a "${INSTALL_DIR}/data/panel.db" "${BACKUP_DIR}/panel-${stamp}.db"
+        echo -e "${GREEN}[OK] Database backed up to ${BACKUP_DIR}/panel-${stamp}.db${RESET}"
+      fi
+      if [[ -f "${INSTALL_DIR}/database.sqlite" ]]; then
+        cp -a "${INSTALL_DIR}/database.sqlite" "${BACKUP_DIR}/database-${stamp}.sqlite"
+        echo -e "${GREEN}[OK] Legacy database backed up to ${BACKUP_DIR}/database-${stamp}.sqlite${RESET}"
+      fi
     fi
   fi
 
+  apt-get update -y
+  apt-get install -y curl wget git ca-certificates sqlite3 build-essential python3 make g++ rsync tar openssl
   deploy_application_files
   write_systemd_service
   echo -e "${GREEN}[Success] FB BAHI Panel reinstalled and restarted.${RESET}"
@@ -246,6 +386,7 @@ action_uninstall() {
   rm -f "${SERVICE_FILE}"
   systemctl daemon-reload
   rm -rf "${INSTALL_DIR}"
+  cleanup_staging
   echo -e "${GREEN}[Success] FB BAHI Panel and systemd service removed cleanly.${RESET}"
 }
 
@@ -255,23 +396,15 @@ action_update() {
     return 1
   fi
 
-  echo -e "${CYAN}[Update] Pulling latest panel updates (preserving database & server data)...${RESET}"
-  pushd "${INSTALL_DIR}" >/dev/null
-  if [[ -d ".git" ]]; then
-    git pull --ff-only
-  else
-    rsync -a --exclude 'node_modules' --exclude 'data' --exclude 'uploads' --exclude 'backups' --exclude 'dist' --exclude 'server.js' --exclude '*.db*' --exclude '.env' --exclude '.git' "${REPO_SOURCE_DIR}/" "${INSTALL_DIR}/"
-  fi
-  mkdir -p "${INSTALL_DIR}/data/servers/mc" "${INSTALL_DIR}/data/servers/vm-backups" "${INSTALL_DIR}/uploads/backgrounds" "${INSTALL_DIR}/backups"
-  npm install
-  npm run build
-  popd >/dev/null
-
-  configure_firewall_port
-  systemctl restart "${SERVICE_NAME}"
-  verify_panel_live
+  echo -e "${CYAN}[Update] Fetching latest updates from GitHub (${BRANCH}) while preserving DB & .env...${RESET}"
+  deploy_application_files
+  write_systemd_service
   echo -e "${GREEN}[Success] FB BAHI Panel updated and restarted.${RESET}"
 }
+
+if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
+  exec < /dev/tty
+fi
 
 while true; do
   print_banner
